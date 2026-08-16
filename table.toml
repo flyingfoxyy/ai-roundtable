@@ -1,6 +1,7 @@
-# Table 参与者配置。删除本文件则使用内置默认（内容与此一致）。
-# 每个参与者：name（唯一）+ cmd（argv 数组，prompt 走 stdin）+ 可选 lens/timeout。
-# 建议给各 CLI 加限权参数，防止其在讨论中调用工具（cwd 已固定为空目录 sandbox/）。
+# Table 参与者名册：每个 [[participants]] 段 = 一个 AI。
+# 增删 AI = 增删段落；调整调用方式改 cmd（argv 数组，prompt 走 stdin，回复取 stdout）。
+# 段落顺序 = 发言与轮值主编顺序（第一个参与者负责合成 v1）。
+# 本文件是唯一名册：缺失时程序会重新生成这份默认配置（Claude/Gemini/Codex）。
 
 [[participants]]
 name = "Claude"
@@ -9,13 +10,13 @@ lens = "重点审查：可维护性与长期复杂度"
 timeout = 300
 
 [[participants]]
-name = "Codex"
-cmd = ["codex", "exec", "--skip-git-repo-check", "-"]
-lens = "重点审查：工程落地成本与迁移风险"
-timeout = 300
-
-[[participants]]
 name = "Gemini"
 cmd = ["gemini"]
 lens = "重点审查：性能、扩展性与运维负担"
+timeout = 300
+
+[[participants]]
+name = "Codex"
+cmd = ["codex", "exec", "--skip-git-repo-check", "-"]
+lens = "重点审查：工程落地成本与迁移风险"
 timeout = 300

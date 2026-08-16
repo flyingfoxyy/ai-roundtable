@@ -25,12 +25,14 @@ def write_script(scenario, role, responses):
 
 
 class TestConfig(unittest.TestCase):
-    def test_defaults_when_no_file(self):
+    def test_missing_file_generates_default_roster(self):
         with tempfile.TemporaryDirectory() as td, contextlib.chdir(td):
             pcs = table.load_config(None)
-        self.assertEqual([p.name for p in pcs], ["Claude", "Codex", "Gemini"])
-        self.assertEqual(pcs[0].cmd, ("claude", "-p"))
-        self.assertEqual(pcs[0].timeout, 300)
+            self.assertTrue(pathlib.Path("table.toml").exists())   # 名册文件被自动生成
+            self.assertEqual([p.name for p in pcs], ["Claude", "Gemini", "Codex"])
+            self.assertEqual(pcs[0].cmd, ("claude", "-p"))
+            self.assertEqual(pcs[0].timeout, 300)
+            self.assertEqual(table.load_config(None), pcs)          # 再次加载走文件，结果一致
 
     def test_load_toml(self):
         with tempfile.TemporaryDirectory() as td:

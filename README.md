@@ -21,17 +21,22 @@ BLOCK 一次列全分级问题）→ 主编修订（逐条处理）→ 循环。
 
 设计文档：`docs/superpowers/specs/2026-08-15-table-roundtable-design.md`
 
-## 配置
+## 配置：参与者名册
 
-编辑 `table.toml`（不存在则用内置默认，两者内容一致）：
+`table.toml` 是**唯一名册**——哪些 AI 参会、怎么调用，全由这个文件控制。
+文件不存在时首次运行会自动生成默认名册（Claude / Gemini / Codex），编辑即可增删 AI：
 
 ```toml
 [[participants]]
 name = "Claude"
-cmd = ["claude", "-p"]        # prompt 走 stdin，回复取 stdout
+cmd = ["claude", "-p"]        # argv 数组；prompt 走 stdin，回复取 stdout
 lens = "重点审查：可维护性与长期复杂度"
 timeout = 300
 ```
+
+- 增删 AI = 增删一个 `[[participants]]` 段落（至少保留 2 个）
+- 段落顺序 = 发言与轮值主编顺序（第一个参与者负责合成 v1）
+- 换别的 CLI 只要满足"stdin 进 prompt、stdout 出回复"即可入局
 
 ## 注意
 
