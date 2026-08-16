@@ -18,6 +18,12 @@ class Verdict(Enum):
     INVALID = "INVALID"
 
 
+class Result(Enum):
+    CONSENSUS = "CONSENSUS"
+    NO_CONSENSUS = "NO_CONSENSUS"
+    INCOMPLETE = "INCOMPLETE"
+
+
 @dataclass(frozen=True)
 class Blocker:
     severity: str  # 硬伤 | 偏好 | 待验证
@@ -183,3 +189,109 @@ class Discussion:
 
     def add_note(self, participant: str, text: str) -> None:
         self.events.append(Event("note", self.cycle, participant, text))
+
+    def valid_vote(self, participant: str) -> Vote | None:
+        cur = self.current
+        if cur is None:
+            return None
+        vote = self.votes.get(participant)
+        if vote and vote.version_id == cur.version_id and vote.verdict is not Verdict.INVALID:
+            return vote
+        return None
+
+    def reviewers_of_current(self) -> list[str]:
+        assert self.current is not None
+        return [p for p in self.participants if p != self.current.author]
+
+    def pending_reviewers(self) -> list[str]:
+        """当前版本上尚无有效票的评审者（缺票补征天然涵盖）。"""
+        return [p for p in self.reviewers_of_current() if self.valid_vote(p) is None]
+
+    def all_reviewers_accepted(self) -> bool:
+        return all(
+            (v := self.valid_vote(p)) is not None and v.verdict is Verdict.ACCEPT
+            for p in self.reviewers_of_current()
+        )
+
+    def has_any_block(self) -> bool:
+        return any(
+            (v := self.valid_vote(p)) is not None and v.verdict is Verdict.BLOCK
+            for p in self.participants
+        )
+
+    def consensus_reached(self) -> bool:
+        if self.current is None:
+            return False
+        return all(
+            (v := self.valid_vote(p)) is not None and v.verdict is Verdict.ACCEPT
+            for p in self.participants
+        )
+
+    def needs_revision(self) -> bool:
+        return self.has_any_block() or self.unaddressed_constraints
+
+    def next_editor(self) -> str:
+        if self.current is None:
+            return self.participants[0]
+        idx = self.participants.index(self.current.author)
+        return self.participants[(idx + 1) % len(self.participants)]
+
+    def add_constraint(self, text: str) -> str:
+        self.constraints.append(text)
+        self.votes.clear()  # 插话作废当前版本全部票
+        self.unaddressed_constraints = True
+        label = f"H{len(self.constraints)}"
+        self.events.append(Event("human", self.cycle, "Human", f"[{label} · 绑定约束] {text}"))
+        return label
+
+    def active_blockers(self) -> list[tuple[str, Blocker]]:
+        out: list[tuple[str, Blocker]] = []
+        for p in self.participants:
+            v = self.valid_vote(p)
+            if v is not None and v.verdict is Verdict.BLOCK:
+                out.extend((p, b) for b in v.blockers)
+        return out
+
+    def outcome(self) -> Result:
+        if self.current is None:
+            return Result.INCOMPLETE
+        if self.consensus_reached():
+            return Result.CONSENSUS
+        cur_id = self.current.version_id
+        has_invalid = any(
+            v.version_id == cur_id and v.verdict is Verdict.INVALID
+            for v in self.votes.values()
+        )
+        missing = any(self.valid_vote(p) is None for p in self.reviewers_of_current())
+        if has_invalid or missing:
+            return Result.INCOMPLETE
+        return Result.NO_CONSENSUS
+
+
+def _vote_dict(v: Vote) -> dict:
+    return {
+        "participant": v.participant,
+        "version_id": v.version_id,
+        "verdict": v.verdict.value,
+        "statement": v.statement,
+        "blockers": [{"severity": b.severity, "text": b.text} for b in v.blockers],
+    }
+
+
+def snapshot(disc: Discussion) -> dict:
+    """state.json 用的可 JSON 化快照。"""
+    return {
+        "topic": disc.topic,
+        "participants": disc.participants,
+        "constraints": disc.constraints,
+        "cycle": disc.cycle,
+        "max_rounds": disc.max_rounds,
+        "outcome": disc.outcome().value,
+        "drafts": [
+            {"number": d.number, "version_id": d.version_id, "author": d.author,
+             "text": d.text, "changelog": d.changelog}
+            for d in disc.drafts
+        ],
+        "votes": {p: _vote_dict(v) for p, v in disc.votes.items()},
+        "vote_log": [_vote_dict(v) for v in disc.vote_log],
+    }

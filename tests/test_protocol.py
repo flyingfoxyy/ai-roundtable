@@ -106,5 +106,87 @@ class TestLedger(unittest.TestCase):
         self.assertEqual(kinds, ["proposal", "draft", "note"])
 
 
+class TestFlow(unittest.TestCase):
+    def make(self):
+        disc = tp.Discussion("题", ["A", "B", "C"], 5)
+        disc.add_draft("A", "v1文", "分歧点")
+        return disc
+
+    ACCEPT = tp.ParsedVerdict(tp.Verdict.ACCEPT, "残余风险")
+    BLOCK = tp.ParsedVerdict(
+        tp.Verdict.BLOCK, "raw", (tp.Blocker("硬伤", "缺一致性"),)
+    )
+
+    def test_pending_reviewers_excludes_author_and_valid_votes(self):
+        disc = self.make()
+        self.assertEqual(disc.pending_reviewers(), ["B", "C"])
+        disc.record_vote("B", self.ACCEPT, "s")
+        self.assertEqual(disc.pending_reviewers(), ["C"])   # 补征只找缺票者
+        disc.record_invalid("C", "解析失败")
+        self.assertEqual(disc.pending_reviewers(), ["C"])   # INVALID 仍是缺票
+
+    def test_consensus_requires_author_confirmation(self):
+        disc = self.make()
+        disc.record_vote("B", self.ACCEPT, "s")
+        disc.record_vote("C", self.ACCEPT, "s")
+        self.assertTrue(disc.all_reviewers_accepted())
+        self.assertFalse(disc.consensus_reached())          # 作者尚未确认
+        disc.record_vote("A", self.ACCEPT, "s")
+        self.assertTrue(disc.consensus_reached())
+        self.assertIs(disc.outcome(), tp.Result.CONSENSUS)
+
+    def test_author_self_block_prevents_consensus(self):
+        disc = self.make()
+        disc.record_vote("B", self.ACCEPT, "s")
+        disc.record_vote("C", self.ACCEPT, "s")
+        disc.record_vote("A", self.BLOCK, "s")
+        self.assertFalse(disc.consensus_reached())
+        self.assertTrue(disc.has_any_block())
+        self.assertTrue(disc.needs_revision())
+
+    def test_add_constraint_voids_votes_and_flags_revision(self):
+        disc = self.make()
+        disc.record_vote("B", self.ACCEPT, "s")
+        label = disc.add_constraint("必须用Python")
+        self.assertEqual(label, "H1")
+        self.assertEqual(disc.votes, {})
+        self.assertTrue(disc.unaddressed_constraints)
+        self.assertTrue(disc.needs_revision())
+        self.assertEqual(disc.constraints, ["必须用Python"])
+
+    def test_next_editor_rotation_wraps(self):
+        disc = tp.Discussion("题", ["A", "B", "C"], 5)
+        self.assertEqual(disc.next_editor(), "A")           # 无草案 → P0
+        disc.add_draft("A", "x", "l")
+        self.assertEqual(disc.next_editor(), "B")
+        disc.add_draft("C", "y", "l")
+        self.assertEqual(disc.next_editor(), "A")           # C 之后回卷
+
+    def test_outcome_paths(self):
+        disc = tp.Discussion("题", ["A", "B"], 5)
+        self.assertIs(disc.outcome(), tp.Result.INCOMPLETE)  # 成稿前终止
+        disc.add_draft("A", "x", "l")
+        self.assertIs(disc.outcome(), tp.Result.INCOMPLETE)  # 评审者缺票
+        disc.record_invalid("B", "失败")
+        self.assertIs(disc.outcome(), tp.Result.INCOMPLETE)  # INVALID
+        disc.record_vote("B", self.BLOCK, "s")
+        self.assertIs(disc.outcome(), tp.Result.NO_CONSENSUS)  # 全员表态但有 BLOCK
+
+    def test_active_blockers_lists_by_participant(self):
+        disc = self.make()
+        disc.record_vote("B", self.BLOCK, "s")
+        self.assertEqual(disc.active_blockers(), [("B", tp.Blocker("硬伤", "缺一致性"))])
+
+    def test_snapshot_roundtrips_json_types(self):
+        import json
+        disc = self.make()
+        disc.record_vote("B", self.ACCEPT, "s")
+        snap = json.loads(json.dumps(tp.snapshot(disc)))
+        self.assertEqual(snap["outcome"], "INCOMPLETE")
+        self.assertEqual(snap["drafts"][0]["author"], "A")
+        self.assertEqual(snap["votes"]["B"]["verdict"], "ACCEPT")
+        self.assertEqual(len(snap["vote_log"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
