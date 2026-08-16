@@ -1,0 +1,21 @@
+# Table 参与者配置。删除本文件则使用内置默认（内容与此一致）。
+# 每个参与者：name（唯一）+ cmd（argv 数组，prompt 走 stdin）+ 可选 lens/timeout。
+# 建议给各 CLI 加限权参数，防止其在讨论中调用工具（cwd 已固定为空目录 sandbox/）。
+
+[[participants]]
+name = "Claude"
+cmd = ["claude", "-p"]
+lens = "重点审查：可维护性与长期复杂度"
+timeout = 300
+
+[[participants]]
+name = "Codex"
+cmd = ["codex", "exec", "--skip-git-repo-check", "-"]
+lens = "重点审查：工程落地成本与迁移风险"
+timeout = 300
+
+[[participants]]
+name = "Gemini"
+cmd = ["gemini"]
+lens = "重点审查：性能、扩展性与运维负担"
+timeout = 300

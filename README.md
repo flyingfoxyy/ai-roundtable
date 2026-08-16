@@ -1,0 +1,41 @@
+# Table —— 多 AI 圆桌辩论
+
+让 claude / codex / gemini 就一个纯文本议题进行结构化对抗辩论，
+产出一份**全员对同一版本文本明确表态接受**的方案；达不成共识则如实输出候选方案与分歧。
+
+## 用法
+
+```bash
+python3 table.py "微服务还是单体：5人团队的新电商项目怎么选？" --max-rounds 5
+```
+
+- 讨论进行中按 **Enter** 可插话（人类约束，最高优先级，作废当前版本全部票）；`/stop` 提前收尾
+- 结果落盘在 `runs/<时间>-<议题>/`：`transcript.md`（全记录）、`final.md`（终局）、
+  `state.json`（协议状态）、`session.jsonl`（调用审计）、`raw/`（无法解析的输出存档）
+
+## 协议
+
+独立立论（并行盲写）→ 轮值主编合成 v1（附分歧点）→ 各评审并行盲审（ACCEPT 附残余风险 /
+BLOCK 一次列全分级问题）→ 主编修订（逐条处理）→ 循环。共识 = 全员（含作者确认票）对同一
+`v{n}-{hash}` 版本 ACCEPT；新版本/人类插话作废全部旧票；缺票绝不计为同意。
+
+设计文档：`docs/superpowers/specs/2026-08-15-table-roundtable-design.md`
+
+## 配置
+
+编辑 `table.toml`（不存在则用内置默认，两者内容一致）：
+
+```toml
+[[participants]]
+name = "Claude"
+cmd = ["claude", "-p"]        # prompt 走 stdin，回复取 stdout
+lens = "重点审查：可维护性与长期复杂度"
+timeout = 300
+```
+
+## 注意
+
+- 议题与全部讨论记录会发送给所有配置的模型供应商；输入 token 随轮数近似平方增长，
+  `--max-rounds` 是主要成本阀门
+- 模型共识 ≠ 事实正确；final.md 的「共同盲区」一节列出讨论中标记的待验证事实
+- 要求 Python ≥ 3.11；零第三方依赖；测试：`python3 -m unittest discover -s tests -t .`
