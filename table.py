@@ -184,11 +184,33 @@ def say_system(msg: str) -> None:
 
 
 def default_intervention() -> str | None:
-    return None  # Task 10 实现真身
+    """非阻塞检查 stdin：讨论中按过 Enter → 在批次边界弹出输入提示。非 TTY 恒为 None。"""
+    if not sys.stdin.isatty():
+        return None
+    ready, _, _ = select.select([sys.stdin], [], [], 0)
+    if not ready:
+        return None
+    sys.stdin.readline()  # 消费触发的回车
+    with _print_lock:
+        try:
+            line = input("你说（空回车继续 · /stop 提前收尾）: ").strip()
+        except EOFError:
+            return None
+    return line or None
 
 
-def preflight(pcs, store) -> None:
-    raise NotImplementedError  # Task 10 实现
+def preflight(pcs: list[ParticipantConfig], store: RunStore) -> None:
+    """开会前逐个 ping CLI，验证认证与可用性；失败中止。"""
+    say_system("启动预检")
+    for pc in pcs:
+        probe = dataclasses.replace(pc, timeout=60)
+        try:
+            out = call_cli(probe, "这是连通性测试。请只回复：PONG",
+                           store.sandbox, store.audit, "preflight")
+        except CliError as exc:
+            raise SystemExit(f"预检失败 — {exc}\n（确认该 CLI 已登录；或用 --skip-preflight 跳过）")
+        note = "" if "PONG" in out.upper() else "（未见 PONG，但回复非空，放行）"
+        say_system(f"预检 {pc.name}: ok {note}")
 
 
 def run(topic: str, pcs: list[ParticipantConfig], max_rounds: int, max_context_chars: int,
@@ -374,3 +396,29 @@ def run(topic: str, pcs: list[ParticipantConfig], max_rounds: int, max_context_c
     store.state(disc)
     say_system(f"结果：{result.value} → {store.dir / 'final.md'}")
     return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="table", description="多 AI 圆桌辩论")
+    ap.add_argument("topic", help="讨论议题（纯文本）")
+    ap.add_argument("--max-rounds", type=int, default=5, help="评审周期上限（默认 5）")
+    ap.add_argument("--config", type=pathlib.Path, default=None,
+                    help="参与者配置 TOML（默认自动找 ./table.toml）")
+    ap.add_argument("--max-context-chars", type=int, default=120_000,
+                    help="讨论记录拼装上限字符数（默认 120000）")
+    ap.add_argument("--runs-dir", type=pathlib.Path, default=pathlib.Path("runs"))
+    ap.add_argument("--skip-preflight", action="store_true", help="跳过启动预检")
+    args = ap.parse_args(argv)
+    if args.max_rounds < 1:
+        raise SystemExit("--max-rounds 至少为 1")
+    pcs = load_config(args.config)
+    try:
+        return run(args.topic, pcs, args.max_rounds, args.max_context_chars,
+                   args.runs_dir, do_preflight=not args.skip_preflight)
+    except KeyboardInterrupt:
+        print("\n已中断；transcript/state/session 均已即时落盘。")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

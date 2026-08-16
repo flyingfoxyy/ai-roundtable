@@ -169,5 +169,18 @@ class TestRunStore(unittest.TestCase):
             self.assertEqual((store.dir / "final.md").read_text(encoding="utf-8"), "终局")
 
 
+class TestPreflight(unittest.TestCase):
+    def test_pass_and_fail(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = pathlib.Path(td)
+            scenario = base / "s"
+            write_script(scenario, "P", ["PONG"])
+            store = table.RunStore(base / "runs", "题")
+            table.preflight([fake_pc("P", scenario)], store)  # 不抛即通过
+            bad = table.ParticipantConfig("Bad", ("definitely-missing-binary-xyz",))
+            with self.assertRaises(SystemExit):
+                table.preflight([bad], store)
+
+
 if __name__ == "__main__":
     unittest.main()
