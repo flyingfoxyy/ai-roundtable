@@ -454,3 +454,67 @@ def render_events_md(events: list[Event]) -> str:
         head = "阶段0" if e.cycle == 0 else f"周期{e.cycle}"
         parts.append(f"\n## [{head}] {e.participant}\n\n{e.text}\n")
     return "".join(parts)
+
+
+def render_final(disc: Discussion, recommendation: str | None) -> str:
+    result = disc.outcome()
+    lines = [
+        f"# 圆桌结果：{result.value}", "",
+        f"**议题：** {disc.topic}", "",
+        f"**参与者：** {', '.join(disc.participants)} · 评审周期 {disc.cycle}/{disc.max_rounds}", "",
+    ]
+    if disc.constraints:
+        lines += ["**人类约束：**"]
+        lines += [f"- H{i + 1}. {c}" for i, c in enumerate(disc.constraints)]
+        lines += [""]
+    cur = disc.current
+    if cur is None:
+        lines += ["讨论在形成任何草案之前终止。", ""]
+    elif result is Result.CONSENSUS:
+        lines += [
+            f"## 最终方案（{cur.version_id} · 全员表态接受的原文，未经任何事后润色）", "",
+            cur.text, "",
+            "## 表态记录", "",
+        ]
+        for p in disc.participants:
+            v = disc.valid_vote(p)
+            lines.append(f"- **{p}** → {v.version_id} ACCEPT")
+            lines.append(f"  - 残余风险声明：{v.statement}")
+        lines += ["", "> 本记录仅证明：以上无状态 CLI 调用对该确切文本返回了 ACCEPT。",
+                  "> 模型共识不等于方案正确。", ""]
+    else:
+        lines += [
+            f"## 当前候选草案（{cur.version_id} · 作者 {cur.author} · 未达成共识）", "",
+            cur.text, "",
+            "## 仍然有效的 blocker", "",
+        ]
+        blockers = disc.active_blockers()
+        if blockers:
+            for sev in ("硬伤", "偏好", "待验证"):
+                group = [(p, b) for p, b in blockers if b.severity == sev]
+                if group:
+                    lines.append(f"**[{sev}]**")
+                    lines += [f"- （{p}）{b.text}" for p, b in group]
+        else:
+            lines.append("（无有效 BLOCK——未达共识源于缺票或人工提前终止）")
+        lines += ["", "## 各方最后立场", ""]
+        for p in disc.participants:
+            v = disc.votes.get(p)
+            if v is None:
+                lines.append(f"- **{p}**：本版本未表态")
+            else:
+                lines.append(f"- **{p}**：{v.verdict.value}（{v.version_id}）— {v.statement[:200]}")
+    seen: set[str] = set()
+    pending = [
+        (v.participant, b) for v in disc.vote_log for b in v.blockers
+        if b.severity == "待验证" and not (b.text in seen or seen.add(b.text))
+    ]
+    lines += ["", "## 共同盲区与外部验证建议", ""]
+    if pending:
+        lines += [f"- （{p}）{b.text}" for p, b in pending]
+    else:
+        lines.append("- 讨论中未显式标记待验证事实。")
+    lines += ["", "> 三个模型可能共享同一种错误知识；关键决策请在模型之外验证。", ""]
+    if recommendation:
+        lines += ["## 附录：主编个人建议（未经全员认可，不构成共识）", "", recommendation, ""]
+    return "\n".join(lines)

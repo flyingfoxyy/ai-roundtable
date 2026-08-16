@@ -257,5 +257,55 @@ class TestPrompts(unittest.TestCase):
         self.assertIn("正文", md)
 
 
+class TestRenderFinal(unittest.TestCase):
+    ACCEPT = tp.ParsedVerdict(tp.Verdict.ACCEPT, "最强反例X；可容忍")
+
+    def test_consensus_document(self):
+        disc = tp.Discussion("题", ["A", "B"], 5)
+        disc.add_draft("A", "最终方案原文", "log")
+        disc.record_vote("B", self.ACCEPT, "s")
+        disc.record_vote("A", self.ACCEPT, "s")
+        doc = tp.render_final(disc, None)
+        self.assertIn("CONSENSUS", doc)
+        self.assertIn("最终方案原文", doc)
+        self.assertIn("未经任何事后润色", doc)
+        self.assertIn("最强反例X", doc)
+        self.assertIn("模型共识不等于方案正确", doc)
+        self.assertNotIn("主编个人建议", doc)
+
+    def test_no_consensus_document_with_recommendation(self):
+        disc = tp.Discussion("题", ["A", "B"], 5)
+        disc.add_draft("A", "候选文", "log")
+        disc.record_vote("B", tp.ParsedVerdict(
+            tp.Verdict.BLOCK, "raw",
+            (tp.Blocker("硬伤", "缺X"), tp.Blocker("待验证", "QPS假设")),
+        ), "s")
+        doc = tp.render_final(disc, "我建议这样折中")
+        self.assertIn("NO_CONSENSUS", doc)
+        self.assertIn("候选文", doc)
+        self.assertIn("[硬伤]", doc)
+        self.assertIn("缺X", doc)
+        self.assertIn("QPS假设", doc)          # 共同盲区聚合待验证项
+        self.assertIn("主编个人建议（未经全员认可", doc)
+        self.assertIn("我建议这样折中", doc)
+
+    def test_incomplete_before_draft(self):
+        disc = tp.Discussion("题", ["A", "B"], 5)
+        doc = tp.render_final(disc, None)
+        self.assertIn("INCOMPLETE", doc)
+        self.assertIn("形成任何草案之前终止", doc)
+
+    def test_pending_facts_deduplicated_in_blind_spot_section(self):
+        disc = tp.Discussion("题", ["A", "B"], 5)
+        disc.add_draft("A", "v1", "l")
+        blk = tp.ParsedVerdict(tp.Verdict.BLOCK, "raw", (tp.Blocker("待验证", "同一假设"),))
+        disc.record_vote("B", blk, "s")
+        disc.add_draft("B", "v2", "l")
+        disc.record_vote("A", blk, "s")
+        doc = tp.render_final(disc, None)
+        blind_section = doc.split("共同盲区")[1]
+        self.assertEqual(blind_section.count("同一假设"), 1)  # vote_log 中出现两次，盲区去重为一条
+
+
 if __name__ == "__main__":
     unittest.main()
