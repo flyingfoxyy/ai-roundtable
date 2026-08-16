@@ -58,3 +58,56 @@ def load_config(path: pathlib.Path | None) -> list[ParticipantConfig]:
     if len({p.name for p in pcs}) != len(pcs):
         raise SystemExit("参与者名字必须唯一")
     return pcs
+
+
+class CliError(Exception):
+    pass
+
+
+def call_cli(pc: ParticipantConfig, prompt: str, cwd, audit, purpose: str) -> str:
+    """调用参与者 CLI（stdin→stdout）。超时/失败自动重试一次；超时击杀整个进程组。"""
+    last = "未知错误"
+    for attempt in (1, 2):
+        rec = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+               "participant": pc.name, "purpose": purpose, "attempt": attempt,
+               "cmd": list(pc.cmd), "prompt_chars": len(prompt)}
+        t0 = time.monotonic()
+        try:
+            proc = subprocess.Popen(pc.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, cwd=cwd, text=True,
+                                    start_new_session=True)
+        except FileNotFoundError:
+            rec["outcome"] = "not-found"
+            audit(rec)
+            raise CliError(f"{pc.name}: 命令不存在 {pc.cmd[0]}")
+        try:
+            out, err = proc.communicate(prompt, timeout=pc.timeout)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            rec.update(outcome="timeout", secs=round(time.monotonic() - t0, 1))
+            audit(rec)
+            last = f"{pc.name}: 超时 {pc.timeout}s"
+            continue
+        rec.update(outcome="ok" if proc.returncode == 0 else "error",
+                   exit=proc.returncode, secs=round(time.monotonic() - t0, 1),
+                   resp_chars=len(out), stderr_tail=err.strip()[-500:])
+        audit(rec)
+        if proc.returncode == 0 and out.strip():
+            return out
+        last = f"{pc.name}: 退出码 {proc.returncode}"
+    raise CliError(last)
+
+
+def call_and_parse(pc: ParticipantConfig, prompt: str, parser, cwd, audit, purpose: str):
+    """调用 + 严格解析；失败发回恰好一次格式纠错；仍失败返回 (None, 最后原文)。"""
+    raw = call_cli(pc, prompt, cwd, audit, purpose)
+    parsed = parser(raw)
+    if parsed is not None:
+        return parsed, raw
+    fix = (f"{prompt}\n\n【格式纠错】你上一次的输出缺少要求的标记行，无法解析。"
+           f"请重新输出**完整**回复并严格遵守上述输出格式。你上一次的输出是：\n{raw[:4000]}")
+    raw = call_cli(pc, fix, cwd, audit, f"{purpose}/format-retry")
+    parsed = parser(raw)
+    return (parsed, raw) if parsed is not None else (None, raw)
