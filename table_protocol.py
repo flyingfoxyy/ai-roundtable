@@ -295,3 +295,162 @@ def snapshot(disc: Discussion) -> dict:
         "votes": {p: _vote_dict(v) for p, v in disc.votes.items()},
         "vote_log": [_vote_dict(v) for v in disc.vote_log],
     }
+
+
+def sanitize_slug(topic: str, max_len: int = 40) -> str:
+    cleaned = re.sub(r"[^\w-]+", "-", topic).strip("-_")
+    return cleaned[:max_len].strip("-_") or "untitled"
+
+
+_FMT_VERDICT = f"""你的输出必须是：先写公开论述，然后独占一行写 {MARKER_VERDICT}，其后是表态：
+- 接受当前草案：首行为 ACCEPT，随后必须附「残余风险声明」——当前方案最强的反例或失败边界，
+  以及你为何认为这些剩余分歧可以容忍。"感觉合理"不构成 ACCEPT。
+- 反对当前草案：首行为 BLOCK，随后一次性列全你发现的全部问题（不得只报告一部分留待下轮），
+  每行一条，格式：
+  - [硬伤] <描述>
+  - [偏好] <描述>
+  - [待验证] <描述>"""
+
+_FMT_EDITOR = f"""你的输出必须依次包含三段：
+1. 你的公开说明；
+2. 独占一行的 {MARKER_DRAFT}，其后是**完整的**新版草案（自包含，不得写"同上"或引用旧版）；
+3. 独占一行的 {MARKER_CHANGELOG}，其后是变更清单。"""
+
+
+def _preamble(name: str, lens: str, role: str, topic: str, constraints: list[str]) -> str:
+    lens_line = f"\n你的审查侧重：{lens}" if lens else ""
+    cons = "\n".join(f"H{i + 1}. {c}" for i, c in enumerate(constraints)) or "（暂无）"
+    return f"""你是多 AI 圆桌讨论的参与者「{name}」。{role}{lens_line}
+
+讨论规则：这是一场对抗性但求真的技术讨论。直接、具体、给论据；不客套，也不为反对而反对。
+人类插话是最高优先级的绑定约束，最终方案必须满足所有人类约束。
+当前人类约束：
+{cons}
+
+议题：
+{topic}"""
+
+
+def build_proposal_prompt(topic: str, constraints: list[str], name: str, lens: str) -> str:
+    return f"""{_preamble(name, lens, "现在是独立立论阶段：你看不到其他参与者的输出。", topic, constraints)}
+
+请独立完成你对议题的分析，并给出你的完整方案。
+输出格式：先写分析，然后独占一行写 {MARKER_PROPOSAL}，其后是你的完整方案。"""
+
+
+def build_merge_prompt(topic: str, constraints: list[str], name: str, lens: str,
+                       proposals: dict[str, str]) -> str:
+    merged = "\n\n".join(f"《{p} 的独立方案》\n{t}" for p, t in proposals.items())
+    return f"""{_preamble(name, lens, "你是本周期的轮值主编。", topic, constraints)}
+
+以下是各参与者互不可见地提交的独立方案：
+
+{merged}
+
+请把它们合成为草案 v1：吸收各方案的合理部分，并在变更清单位置**明确列出各方案之间的分歧点**
+（这是后续辩论的靶子，不要抹平分歧）。
+{_FMT_EDITOR}"""
+
+
+def build_review_prompt(topic: str, constraints: list[str], name: str, lens: str,
+                        draft: Draft, transcript: str, first_cycle: bool) -> str:
+    extra = ("\n本周期是第 1 评审周期：若你选择 ACCEPT，必须逐条回应变更清单中列出的每一个分歧点。"
+             if first_cycle else "")
+    return f"""{_preamble(name, lens, "你是当前版本的评审者。同周期其他评审者的发言对你不可见。", topic, constraints)}
+
+已公开的讨论记录：
+{transcript}
+
+当前草案 {draft.version_id}（作者：{draft.author}）：
+{draft.text}
+
+上一版变更清单：
+{draft.changelog}
+
+请评审当前草案。{extra}
+{_FMT_VERDICT}"""
+
+
+def build_confirm_prompt(topic: str, constraints: list[str], name: str, lens: str,
+                         draft: Draft, transcript: str) -> str:
+    return f"""{_preamble(name, lens,
+        "全体评审者已接受你起草的当前版本。生成不等于审查：请以评审者身份重新审读你自己的草案原文，做最后确认投票。",
+        topic, constraints)}
+
+已公开的讨论记录：
+{transcript}
+
+待确认草案 {draft.version_id}（作者：你）：
+{draft.text}
+
+{_FMT_VERDICT}"""
+
+
+def build_revision_prompt(topic: str, constraints: list[str], name: str, lens: str,
+                          draft: Draft, blockers: list[tuple[str, Blocker]],
+                          transcript: str) -> str:
+    if blockers:
+        blk = "\n".join(f"- （{p}）[{b.severity}] {b.text}" for p, b in blockers)
+    else:
+        blk = "（本轮无 BLOCK，修订由新的人类约束触发）"
+    return f"""{_preamble(name, lens, "你是本周期的轮值主编。", topic, constraints)}
+
+已公开的讨论记录：
+{transcript}
+
+当前草案 {draft.version_id}（作者：{draft.author}）：
+{draft.text}
+
+待处理的全部 blocker：
+{blk}
+
+请产出下一版草案。变更清单必须逐条说明对每个 blocker（及每条新的人类约束）的处理：
+采纳 / 部分采纳 / 拒绝并说明理由。
+{_FMT_EDITOR}"""
+
+
+def build_recommendation_prompt(topic: str, constraints: list[str], name: str, lens: str,
+                                draft: Draft | None, blockers: list[tuple[str, Blocker]],
+                                transcript: str) -> str:
+    cur = (f"当前候选草案 {draft.version_id}：\n{draft.text}"
+           if draft else "（讨论在成稿前终止，无候选草案）")
+    blk = "\n".join(f"- （{p}）[{b.severity}] {b.text}" for p, b in blockers) or "（无）"
+    return f"""{_preamble(name, lens,
+        "讨论未达成共识而终止。你被指定给出个人建议——它将被明确标注为「主编个人建议，未经全员认可」。",
+        topic, constraints)}
+
+已公开的讨论记录：
+{transcript}
+
+{cur}
+
+仍然有效的 blocker：
+{blk}
+
+请给出你的最终建议方案（自由文本，无需标记），并说明你如何权衡未决分歧。"""
+
+
+def render_transcript(events: list[Event], max_chars: int = 120_000) -> str:
+    """按周期渲染讨论记录；超长时从最早周期起丢弃正文，保留占位行；至少保留最新周期。"""
+    if not events:
+        return "（暂无）"
+    cycles = sorted({e.cycle for e in events})
+    text = ""
+    for dropped in range(len(cycles)):
+        parts: list[str] = []
+        for c in cycles[:dropped]:
+            parts.append("（阶段0发言已省略）" if c == 0 else f"（第 {c} 周期讨论已省略）")
+        for c in cycles[dropped:]:
+            parts.extend(f"【{e.participant}】\n{e.text}" for e in events if e.cycle == c)
+        text = "\n\n".join(parts)
+        if len(text) <= max_chars:
+            return text
+    return text
+
+
+def render_events_md(events: list[Event]) -> str:
+    parts = []
+    for e in events:
+        head = "阶段0" if e.cycle == 0 else f"周期{e.cycle}"
+        parts.append(f"\n## [{head}] {e.participant}\n\n{e.text}\n")
+    return "".join(parts)

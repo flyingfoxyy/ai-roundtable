@@ -188,5 +188,74 @@ class TestFlow(unittest.TestCase):
         self.assertEqual(len(snap["vote_log"]), 1)
 
 
+class TestPrompts(unittest.TestCase):
+    def test_sanitize_slug(self):
+        self.assertEqual(tp.sanitize_slug("微服务 还是/单体？"), "微服务-还是-单体")
+        self.assertEqual(tp.sanitize_slug("../../etc"), "etc")
+        self.assertEqual(len(tp.sanitize_slug("长" * 100)), 40)
+        self.assertEqual(tp.sanitize_slug("？！。"), "untitled")
+
+    def test_proposal_prompt_contains_essentials(self):
+        p = tp.build_proposal_prompt("选型题", ["必须用Python"], "Claude", "可维护性")
+        for needle in ("Claude", "可维护性", "选型题", "H1. 必须用Python",
+                       tp.MARKER_PROPOSAL, "看不到其他参与者"):
+            self.assertIn(needle, p)
+
+    def test_review_prompt_first_cycle_extra_rule(self):
+        d = tp.Draft(1, "草案文", "A", "分歧点清单")
+        base = ("题", [], "B", "")
+        p1 = tp.build_review_prompt(*base, d, "记录", True)
+        p2 = tp.build_review_prompt(*base, d, "记录", False)
+        self.assertIn("逐条回应", p1)
+        self.assertNotIn("逐条回应", p2)
+        for needle in (d.version_id, "草案文", "分歧点清单", tp.MARKER_VERDICT,
+                       "硬伤", "残余风险声明", "一次性列全"):
+            self.assertIn(needle, p1)
+
+    def test_revision_prompt_lists_blockers(self):
+        d = tp.Draft(1, "草案文", "A", "log")
+        p = tp.build_revision_prompt(
+            "题", [], "B", "", d, [("C", tp.Blocker("硬伤", "缺X"))], "记录"
+        )
+        self.assertIn("（C）[硬伤] 缺X", p)
+        self.assertIn(tp.MARKER_DRAFT, p)
+        self.assertIn(tp.MARKER_CHANGELOG, p)
+        self.assertIn("完整的", p)
+
+    def test_confirm_prompt_addresses_author(self):
+        d = tp.Draft(2, "文", "A", "log")
+        p = tp.build_confirm_prompt("题", [], "A", "", d, "记录")
+        self.assertIn("生成不等于审查", p)
+        self.assertIn(d.version_id, p)
+
+    def test_recommendation_prompt_handles_no_draft(self):
+        p = tp.build_recommendation_prompt("题", [], "A", "", None, [], "记录")
+        self.assertIn("成稿前终止", p)
+        self.assertIn("未经全员认可", p)
+
+    def test_render_transcript_truncates_oldest_cycles(self):
+        events = [
+            tp.Event("proposal", 0, "A", "早期长文" * 5000),
+            tp.Event("review", 1, "B", "中期" * 10),
+            tp.Event("review", 2, "C", "最新发言"),
+        ]
+        out = tp.render_transcript(events, max_chars=500)
+        self.assertIn("（阶段0发言已省略）", out)
+        self.assertIn("最新发言", out)
+        self.assertNotIn("早期长文", out)
+        full = tp.render_transcript(events, max_chars=10_000_000)
+        self.assertIn("早期长文", full)
+
+    def test_render_transcript_always_keeps_newest_cycle(self):
+        events = [tp.Event("review", 1, "B", "唯一发言" * 1000)]
+        out = tp.render_transcript(events, max_chars=10)
+        self.assertIn("唯一发言", out)
+
+    def test_render_events_md(self):
+        md = tp.render_events_md([tp.Event("review", 2, "B", "正文")])
+        self.assertIn("## [周期2] B", md)
+        self.assertIn("正文", md)
+
+
 if __name__ == "__main__":
     unittest.main()
