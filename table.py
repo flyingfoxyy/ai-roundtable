@@ -159,3 +159,218 @@ class RunStore:
 
     def final(self, text: str) -> None:
         (self.dir / "final.md").write_text(text, encoding="utf-8")
+
+
+PALETTE = ["\033[36m", "\033[33m", "\033[35m", "\033[32m", "\033[34m", "\033[31m"]
+RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
+USE_COLOR = sys.stdout.isatty()
+_print_lock = threading.Lock()
+
+
+def say(name: str, color: str, header: str, body: str) -> None:
+    with _print_lock:
+        if USE_COLOR:
+            print(f"\n{color}{BOLD}◆ {name}{RESET}{DIM} · {header}{RESET}\n{body}\n")
+        else:
+            print(f"\n◆ {name} · {header}\n{body}\n")
+
+
+def say_system(msg: str) -> None:
+    with _print_lock:
+        if USE_COLOR:
+            print(f"\n{DIM}── {msg} ──{RESET}")
+        else:
+            print(f"\n── {msg} ──")
+
+
+def default_intervention() -> str | None:
+    return None  # Task 10 实现真身
+
+
+def preflight(pcs, store) -> None:
+    raise NotImplementedError  # Task 10 实现
+
+
+def run(topic: str, pcs: list[ParticipantConfig], max_rounds: int, max_context_chars: int,
+        runs_dir: pathlib.Path, intervention=None, do_preflight: bool = True) -> int:
+    disc = tp.Discussion(topic, [p.name for p in pcs], max_rounds)
+    store = RunStore(runs_dir, topic)
+    by_name = {p.name: p for p in pcs}
+    colors = {p.name: PALETTE[i % len(PALETTE)] for i, p in enumerate(pcs)}
+    check_input = intervention if intervention is not None else default_intervention
+    say_system(f"运行目录：{store.dir}")
+
+    if do_preflight:
+        preflight(pcs, store)
+
+    stopped = False
+
+    def checkpoint() -> bool:
+        """批次边界检查人类插话。返回 True 表示 /stop。"""
+        nonlocal stopped
+        text = check_input()
+        if text is None:
+            return False
+        if text.strip() == "/stop":
+            stopped = True
+            disc.add_note("Human", "[/stop] 人工提前终止，进入终局输出")
+            store.transcript(disc)
+            store.state(disc)
+            return True
+        label = disc.add_constraint(text.strip())
+        say("Human", "", f"插话 {label} · 已作废当前版本全部票", text.strip())
+        store.transcript(disc)
+        store.state(disc)
+        return False
+
+    def speak(pc: ParticipantConfig, prompt: str, parser, purpose: str):
+        try:
+            parsed, raw = call_and_parse(pc, prompt, parser, store.sandbox, store.audit, purpose)
+        except CliError as exc:
+            say(pc.name, colors[pc.name], purpose, f"[调用失败] {exc}")
+            return "error", str(exc)
+        if parsed is None:
+            store.raw(pc.name, raw)
+            say(pc.name, colors[pc.name], purpose, "[两次输出均无法解析，本次缺票，原文已存档 raw/]")
+            return "invalid", raw
+        return "ok", parsed
+
+    def batch(jobs):
+        """jobs: list[(pc, prompt, parser, purpose)] → {name: (status, payload)}。并行即盲审。"""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+            futs = {ex.submit(speak, *job): job[0].name for job in jobs}
+            return {futs[f]: f.result() for f in concurrent.futures.as_completed(futs)}
+
+    def editor_call(build, purpose: str) -> bool:
+        """按轮转尝试主编调用；失败顺延下一位；全员失败返回 False。"""
+        order = disc.participants
+        idx = order.index(disc.next_editor())
+        for step in range(len(order)):
+            name = order[(idx + step) % len(order)]
+            pc = by_name[name]
+            status, payload = speak(pc, build(pc), tp.parse_editor, purpose)
+            if status == "ok":
+                speech, text, changelog = payload
+                draft = disc.add_draft(name, text, changelog, speech)
+                say(name, colors[name], f"{purpose} → {draft.version_id}", speech or "（无说明）")
+                return True
+            disc.add_note(name, f"主编调用失败（{purpose}），轮转下一位")
+        return False
+
+    # ── 阶段0：独立立论（并行、互不可见） ──
+    say_system("阶段0：独立立论")
+    jobs = [(pc, tp.build_proposal_prompt(topic, disc.constraints, pc.name, pc.lens),
+             tp.parse_proposal, "proposal") for pc in pcs]
+    for name, (status, payload) in batch(jobs).items():
+        if status == "ok":
+            analysis, prop = payload
+            disc.add_proposal(name, analysis, prop)
+            say(name, colors[name], "独立立论", f"{analysis}\n\n【独立方案】\n{prop}")
+        else:
+            disc.add_note(name, "阶段0未产出独立方案")
+    store.transcript(disc)
+    store.state(disc)
+    if not disc.proposals:
+        say_system("全部参与者阶段0失败，中止")
+        return 1
+
+    # ── 阶段1：合成 v1 ──
+    if not checkpoint():
+        say_system("阶段1：合成 v1")
+        if not editor_call(
+            lambda pc: tp.build_merge_prompt(topic, disc.constraints, pc.name, pc.lens,
+                                             disc.proposals),
+            "merge",
+        ):
+            say_system("全部主编候选失败，中止")
+            return 1
+        store.transcript(disc)
+        store.state(disc)
+
+    # ── 评审周期 ──
+    if not stopped and disc.current is not None:
+        for cycle in range(1, max_rounds + 1):
+            disc.cycle = cycle
+            targets = disc.pending_reviewers()
+            if targets:
+                say_system(f"周期 {cycle}/{max_rounds}：评审 {disc.current.version_id}"
+                           f"（{', '.join(targets)}）")
+                ctx = tp.render_transcript(disc.events, max_context_chars)
+                jobs = [(by_name[n],
+                         tp.build_review_prompt(topic, disc.constraints, n, by_name[n].lens,
+                                                disc.current, ctx, cycle == 1),
+                         tp.parse_verdict, f"review-c{cycle}") for n in targets]
+                res = batch(jobs)
+                for n in targets:
+                    status, payload = res[n]
+                    if status == "ok":
+                        speech, pv = payload
+                        disc.record_vote(n, pv, speech)
+                        say(n, colors[n],
+                            f"评审 {disc.current.version_id} → {pv.verdict.value}", speech)
+                    else:
+                        disc.record_invalid(
+                            n, "输出无法解析" if status == "invalid" else f"调用失败：{payload}")
+                store.transcript(disc)
+                store.state(disc)
+            if checkpoint():
+                break
+            if disc.all_reviewers_accepted() and not disc.consensus_reached():
+                author = disc.current.author
+                say_system(f"全体评审通过，作者 {author} 最后确认（生成≠审查）")
+                ctx = tp.render_transcript(disc.events, max_context_chars)
+                status, payload = speak(
+                    by_name[author],
+                    tp.build_confirm_prompt(topic, disc.constraints, author,
+                                            by_name[author].lens, disc.current, ctx),
+                    tp.parse_verdict, f"confirm-c{cycle}")
+                if status == "ok":
+                    speech, pv = payload
+                    disc.record_vote(author, pv, speech)
+                    say(author, colors[author], f"作者确认 → {pv.verdict.value}", speech)
+                else:
+                    disc.record_invalid(
+                        author, "确认票无法解析" if status == "invalid" else f"调用失败：{payload}")
+                store.transcript(disc)
+                store.state(disc)
+                if checkpoint():
+                    break
+            if disc.consensus_reached():
+                break
+            if cycle == max_rounds:
+                break
+            if disc.needs_revision():
+                say_system(f"周期 {cycle}：主编修订")
+                ctx = tp.render_transcript(disc.events, max_context_chars)
+                if not editor_call(
+                    lambda pc: tp.build_revision_prompt(topic, disc.constraints, pc.name,
+                                                        pc.lens, disc.current,
+                                                        disc.active_blockers(), ctx),
+                    f"revise-c{cycle}",
+                ):
+                    say_system("全部主编候选失败，提前终局")
+                    break
+                store.transcript(disc)
+                store.state(disc)
+                if checkpoint():
+                    break
+
+    # ── 终局 ──
+    result = disc.outcome()
+    recommendation = None
+    if result is not tp.Result.CONSENSUS and disc.proposals:
+        name = disc.next_editor()
+        say_system(f"未达成共识，征询 {name} 的个人建议（明确标注，不构成共识）")
+        ctx = tp.render_transcript(disc.events, max_context_chars)
+        status, payload = speak(
+            by_name[name],
+            tp.build_recommendation_prompt(topic, disc.constraints, name, by_name[name].lens,
+                                           disc.current, disc.active_blockers(), ctx),
+            lambda t: t.strip() or None, "recommendation")
+        if status == "ok":
+            recommendation = payload
+            say(name, colors[name], "主编个人建议", recommendation)
+    store.final(tp.render_final(disc, recommendation))
+    store.state(disc)
+    say_system(f"结果：{result.value} → {store.dir / 'final.md'}")
+    return 0
