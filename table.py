@@ -111,3 +111,51 @@ def call_and_parse(pc: ParticipantConfig, prompt: str, parser, cwd, audit, purpo
     raw = call_cli(pc, fix, cwd, audit, f"{purpose}/format-retry")
     parsed = parser(raw)
     return (parsed, raw) if parsed is not None else (None, raw)
+
+
+class RunStore:
+    """运行目录与事件级即时落盘。"""
+
+    def __init__(self, base: pathlib.Path, topic: str):
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+        slug = tp.sanitize_slug(topic)
+        d = base / f"{stamp}-{slug}"
+        n = 2
+        while d.exists():
+            d = base / f"{stamp}-{slug}-{n}"
+            n += 1
+        self.dir = d
+        self.sandbox = d / "sandbox"
+        self.sandbox.mkdir(parents=True)
+        (d / "raw").mkdir()
+        (d / "transcript.md").write_text(f"# 圆桌讨论\n\n**议题：** {topic}\n", encoding="utf-8")
+        self._written_events = 0
+
+    def transcript(self, disc: tp.Discussion) -> None:
+        new = disc.events[self._written_events:]
+        if not new:
+            return
+        with (self.dir / "transcript.md").open("a", encoding="utf-8") as f:
+            f.write(tp.render_events_md(new))
+            f.flush()
+            os.fsync(f.fileno())
+        self._written_events = len(disc.events)
+
+    def state(self, disc: tp.Discussion) -> None:
+        tmp = self.dir / "state.json.tmp"
+        tmp.write_text(json.dumps(tp.snapshot(disc), ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        os.replace(tmp, self.dir / "state.json")
+
+    def audit(self, rec: dict) -> None:
+        with (self.dir / "session.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def raw(self, name: str, text: str) -> None:
+        n = len(list((self.dir / "raw").iterdir())) + 1
+        (self.dir / "raw" / f"{n:03d}-{name}.txt").write_text(text, encoding="utf-8")
+
+    def final(self, text: str) -> None:
+        (self.dir / "final.md").write_text(text, encoding="utf-8")

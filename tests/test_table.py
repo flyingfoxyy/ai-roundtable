@@ -129,5 +129,45 @@ class TestAdapter(unittest.TestCase):
         self.assertEqual(raw, "坏2")
 
 
+class TestRunStore(unittest.TestCase):
+    def test_dir_naming_and_conflict(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = pathlib.Path(td)
+            s1 = table.RunStore(base, "议题/名？")
+            s2 = table.RunStore(base, "议题/名？")
+            self.assertTrue(s1.sandbox.is_dir())
+            self.assertNotEqual(s1.dir, s2.dir)
+            self.assertIn("议题-名", s1.dir.name)
+
+    def test_incremental_transcript_and_atomic_state(self):
+        import json
+        with tempfile.TemporaryDirectory() as td:
+            base = pathlib.Path(td)
+            store = table.RunStore(base, "题")
+            disc = tp.Discussion("题", ["A", "B"], 5)
+            disc.add_proposal("A", "分析", "方案")
+            store.transcript(disc)
+            store.state(disc)
+            disc.add_draft("A", "v1", "log")
+            store.transcript(disc)
+            text = (store.dir / "transcript.md").read_text(encoding="utf-8")
+            self.assertEqual(text.count("[阶段0] A"), 2)  # proposal + draft 各一次，无重复
+            snap = json.loads((store.dir / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(snap["topic"], "题")
+
+    def test_audit_raw_final(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = table.RunStore(pathlib.Path(td), "题")
+            store.audit({"a": 1})
+            store.audit({"b": "中文"})
+            store.raw("X", "坏输出")
+            store.final("终局")
+            lines = (store.dir / "session.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertIn("中文", lines[1])
+            self.assertEqual(len(list((store.dir / "raw").iterdir())), 1)
+            self.assertEqual((store.dir / "final.md").read_text(encoding="utf-8"), "终局")
+
+
 if __name__ == "__main__":
     unittest.main()
