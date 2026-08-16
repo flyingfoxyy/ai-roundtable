@@ -93,3 +93,93 @@ def parse_editor(text: str) -> tuple[str, str, str] | None:
     if not draft or not changelog:
         return None
     return speech, draft, changelog
+
+
+@dataclass(frozen=True)
+class Draft:
+    number: int
+    text: str
+    author: str
+    changelog: str  # v1: 分歧点清单；其后: 变更清单
+
+    @property
+    def version_id(self) -> str:
+        digest = hashlib.sha256(self.text.encode("utf-8")).hexdigest()[:8]
+        return f"v{self.number}-{digest}"
+
+
+@dataclass(frozen=True)
+class Vote:
+    participant: str
+    version_id: str
+    verdict: Verdict
+    statement: str
+    blockers: tuple[Blocker, ...] = ()
+
+
+@dataclass(frozen=True)
+class Event:
+    kind: str  # proposal | draft | review | human | note
+    cycle: int  # 0 = 阶段0/合成
+    participant: str
+    text: str
+
+
+class Discussion:
+    """协议状态机。纯内存，无 IO。"""
+
+    def __init__(self, topic: str, participants: list[str], max_rounds: int):
+        if len(participants) < 2:
+            raise ValueError("至少需要 2 名参与者")
+        self.topic = topic
+        self.participants = list(participants)
+        self.max_rounds = max_rounds
+        self.constraints: list[str] = []
+        self.proposals: dict[str, str] = {}
+        self.drafts: list[Draft] = []
+        self.votes: dict[str, Vote] = {}   # 当前版本的票（含 INVALID 占位）
+        self.vote_log: list[Vote] = []     # 全部历史票（含被作废的）
+        self.events: list[Event] = []
+        self.cycle = 0
+        self.unaddressed_constraints = False
+
+    @property
+    def current(self) -> Draft | None:
+        return self.drafts[-1] if self.drafts else None
+
+    def add_proposal(self, participant: str, analysis: str, proposal: str) -> None:
+        self.proposals[participant] = proposal
+        self.events.append(
+            Event("proposal", 0, participant, f"{analysis}\n\n【独立方案】\n{proposal}")
+        )
+
+    def add_draft(self, author: str, text: str, changelog: str, speech: str = "") -> Draft:
+        draft = Draft(len(self.drafts) + 1, text, author, changelog)
+        self.drafts.append(draft)
+        self.votes.clear()  # 新版本作废全部旧票（含作者）
+        self.unaddressed_constraints = False
+        body = f"{speech}\n\n【草案 {draft.version_id}】\n{text}\n\n【变更清单】\n{changelog}".strip()
+        self.events.append(Event("draft", self.cycle, author, body))
+        return draft
+
+    def record_vote(self, participant: str, parsed: ParsedVerdict, speech: str) -> Vote:
+        assert self.current is not None
+        vote = Vote(participant, self.current.version_id, parsed.verdict,
+                    parsed.statement, parsed.blockers)
+        self.votes[participant] = vote
+        self.vote_log.append(vote)
+        self.events.append(Event(
+            "review", self.cycle, participant,
+            f"{speech}\n\n【表态 · {self.current.version_id}】{parsed.verdict.value}: {parsed.statement}",
+        ))
+        return vote
+
+    def record_invalid(self, participant: str, reason: str) -> None:
+        assert self.current is not None
+        vote = Vote(participant, self.current.version_id, Verdict.INVALID, reason)
+        self.votes[participant] = vote
+        self.vote_log.append(vote)
+        self.events.append(Event("note", self.cycle, participant, f"[本周期缺票] {reason}"))
+
+    def add_note(self, participant: str, text: str) -> None:
+        self.events.append(Event("note", self.cycle, participant, text))
