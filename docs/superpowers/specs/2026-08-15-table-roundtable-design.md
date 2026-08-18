@@ -11,7 +11,7 @@
 **非目标（v1 明确不做）**：
 - 代码库相关议题（AI 不访问文件）
 - Web 界面、token 级流式输出
-- 断点续跑（`--resume`）
+- 断点续跑（`--resume`）—— **已于 2026-08-18 追加实现，见 §14**
 - 动态主持人（LLM 决定发言顺序）
 - 讨论记录摘要压缩（仅做简单截断保护）
 
@@ -214,5 +214,39 @@ tests/
 
 ## 13. 未来方向（不进 v1）
 
-gemini 对本设计的交叉评审；`--resume` 续跑；动态主持人；代码库议题支持（给 CLI 开受控工具权限）；
+gemini 对本设计的交叉评审；动态主持人；代码库议题支持（给 CLI 开受控工具权限）；
 讨论记录的 LLM 摘要压缩；Web 观战界面。
+
+## 14. 续会 `--continue`（2026-08-18 追加）
+
+实际使用中 AI 常吵不出共识，需要人去做实验再回来推进。本节把原 §13 的"断点续跑"落地。
+
+**语义：续会 = 一次迟到的插话。** 复用 §6 已定义的人类插话语义，不新增协议规则：
+新信息作为最高优先级绑定约束 `H_n` 注入 → 作废当前草案全部票（§5 不变量）→
+`needs_revision()` 转真 → 轮值主编先据此出新版并在变更清单中逐条回应 → 全员重新盲审。
+
+**入口**（`--continue` 是标志位，不吃值，避免与"新信息"位置参数产生歧义）：
+
+```bash
+python3 table.py --continue "实测：…"                  # 续最近一场留有 state.json 的会议
+python3 table.py --continue --from runs/<dir> "实测：…"  # 指定场次
+python3 table.py --continue --info-file bench.md        # 长报告走文件（与位置参数二选一）
+python3 table.py --continue                             # 不注入新信息，纯粹再吵几轮
+```
+
+**持久化格式**：`state.json` 升级为 `format: 2`，补入 `events`、`proposals`、
+`unaddressed_constraints` 与 `roster`（参与者名册，由 IO 层写入），使记录自描述、可完整复原。
+纯逻辑侧新增 `restore(snap) -> Discussion`；格式不符（旧记录/未来版本）→ 明确报错，绝不复原半份上下文。
+
+**记录归属**：同目录续写。transcript 追加"续会"分隔记录与 `H_n`；周期编号从快照的 `cycle` 续接；
+`state.json` 原地更新（可反复续）；上次的 `final.md` 归档为 `final-1.md`、`final-2.md`…
+
+**语义细节**：
+- `--max-rounds` 在续会时是**本次新增**的轮数预算，`disc.max_rounds` 更新为本次最后一个周期号
+- 参与者名册取自快照而非当前 `table.toml`——共识要求同一批成员；`--config` 在续会时忽略并提示
+- 目标目录无 `state.json` → 报错（预检失败或阶段0未完成的会议不可续）
+- 上次已达成 CONSENSUS 也允许续，但在 transcript 中显式标注"在既有共识上重开"
+
+**测试**：快照往返一致性（含 events/blockers/票绑定）、旧格式拒绝、`RunStore.reopen` 不重复写
+transcript、`final.md` 归档链、假 CLI 跑完整"NO_CONSENSUS → 注入实测数据 → 达成共识"链路、
+命令行端到端与参数校验。

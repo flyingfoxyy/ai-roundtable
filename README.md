@@ -13,6 +13,26 @@ python3 table.py "微服务还是单体：5人团队的新电商项目怎么选�
 - 结果落盘在 `runs/<时间>-<议题>/`：`transcript.md`（全记录）、`final.md`（终局）、
   `state.json`（协议状态）、`session.jsonl`（调用审计）、`raw/`（无法解析的输出存档）
 
+## 续会：带着新证据接着吵
+
+AI 们常常吵不出共识，需要你去做实验、查资料。拿到结果后用 `--continue` 让会议从上次结束处继续：
+
+```bash
+python3 table.py --continue "实测：SQLite 在 8 并发写下 P99 400ms，Postgres 12ms"
+python3 table.py --continue --from runs/20260816-1522-… "实测结果…"   # 指定场次
+python3 table.py --continue --info-file bench.md                      # 长报告走文件
+python3 table.py --continue                                           # 不带新信息，再吵几轮
+```
+
+续会 = 一次迟到的插话：新信息作为最高优先级的绑定约束 `H_n` 注入，作废当前草案的全部票，
+轮值主编必须先据此出新版并逐条回应，然后全员重新盲审。
+
+- 默认续**最近一场**留有 `state.json` 的会议；`--from` 指定场次
+- 记录写回**同一目录**：transcript 连续追加、周期编号接着走；上次的 `final.md` 归档为 `final-1.md`
+- 参与者名册取自会议记录（共识要求同一批成员），`--config` 在续会时被忽略
+- `--max-rounds` 在续会时是**本次新增**的轮数预算
+- 可以反复续；上次已达成共识也能续（新证据本就可能推翻它，会在记录中标注）
+
 ## 协议
 
 独立立论（并行盲写）→ 轮值主编合成 v1（附分歧点）→ 各评审并行盲审（ACCEPT 附残余风险 /

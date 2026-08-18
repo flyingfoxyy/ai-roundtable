@@ -265,5 +265,121 @@ class TestFailureSemantics(Base):
         self.assertEqual(len(state["drafts"]), 1)
 
 
+class TestContinue(Base):
+    """续会：从上次结束处接着开，并注入休会期间获得的外部信息。"""
+
+    def first_meeting(self):
+        """跑一场 1 轮就结束、以 BLOCK 收场的会议（NO_CONSENSUS）。"""
+        write_script(self.scenario, "A", [
+            proposal("pa"), editor_out("v1文", "分歧"),
+            # 续会阶段 A 的调用：评审 v2
+            accept("有了实测数据，v2 可以接受"),
+        ])
+        write_script(self.scenario, "B", [
+            proposal("pb"), block(("硬伤", "缺实测数据")),
+            "休会前的主编个人建议",   # 首场 NO_CONSENSUS 终局会征询一次
+            # 以下是续会阶段 B 的调用：主编修订 v2 → 作者确认
+            editor_out("v2文含实测数据", "处理：\n- 采纳 H1 实测结果"),
+            accept("作者确认：新证据已纳入"),
+        ])
+        pcs = [fake_pc(n, self.scenario) for n in "AB"]
+        code = self.run_table(pcs, max_rounds=1)
+        self.assertEqual(code, 0)
+        state = json.loads(self.read("state.json"))
+        self.assertEqual(state["outcome"], "NO_CONSENSUS")
+        return pcs
+
+    def test_continue_injects_info_voids_votes_and_reaches_consensus(self):
+        self.first_meeting()
+        run_dir = self.run_dir()
+        before_transcript = self.read("transcript.md")
+
+        code = table.run_continue(run_dir, "实测：SQLite 在 8 并发写下 P99 400ms",
+                                  max_rounds=2, max_context_chars=120_000,
+                                  intervention=lambda: None, do_preflight=False)
+        self.assertEqual(code, 0)
+
+        state = json.loads(self.read("state.json"))
+        self.assertEqual(state["constraints"], ["实测：SQLite 在 8 并发写下 P99 400ms"])
+        self.assertEqual(state["outcome"], "CONSENSUS")
+        self.assertEqual(len(state["drafts"]), 2)          # 主编据新证据出了 v2
+        self.assertGreater(state["cycle"], 1)              # 周期编号接着走
+
+        # 新信息作为绑定约束进入主编与评审的 prompt
+        revise_prompt = (self.scenario / "calls" / "B-4-prompt.txt").read_text(encoding="utf-8")
+        self.assertIn("H1. 实测：SQLite 在 8 并发写下 P99 400ms", revise_prompt)
+
+        # 同一目录续写：旧记录保留，新发言追加
+        after = self.read("transcript.md")
+        self.assertTrue(after.startswith(before_transcript))
+        self.assertIn("续会", after)
+        self.assertIn("v2文含实测数据", after)
+
+        # 实验前的结论被归档，final.md 是最新结论
+        self.assertIn("NO_CONSENSUS", (run_dir / "final-1.md").read_text(encoding="utf-8"))
+        self.assertIn("CONSENSUS", self.read("final.md"))
+        self.assertEqual(len(list(self.runs.iterdir())), 1)  # 没有新建目录
+
+    def test_continue_without_new_info_is_allowed(self):
+        self.first_meeting()
+        code = table.run_continue(self.run_dir(), None, max_rounds=2,
+                                  max_context_chars=120_000,
+                                  intervention=lambda: None, do_preflight=False)
+        self.assertEqual(code, 0)
+        state = json.loads(self.read("state.json"))
+        self.assertEqual(state["constraints"], [])         # 无新信息则不注入约束
+        self.assertEqual(state["outcome"], "CONSENSUS")    # 靠既有 blocker 继续推进
+
+    def test_continue_rejects_dir_without_resumable_state(self):
+        empty = self.runs / "空目录"
+        empty.mkdir(parents=True)
+        with self.assertRaises(SystemExit):
+            table.run_continue(empty, "信息", max_rounds=1, max_context_chars=120_000,
+                               intervention=lambda: None, do_preflight=False)
+
+    def test_continue_rejects_old_snapshot_format(self):
+        self.first_meeting()
+        run_dir = self.run_dir()
+        snap = json.loads(self.read("state.json"))
+        del snap["format"]                                  # 模拟旧版本产生的记录
+        (run_dir / "state.json").write_text(json.dumps(snap), encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            table.run_continue(run_dir, "信息", max_rounds=1, max_context_chars=120_000,
+                               intervention=lambda: None, do_preflight=False)
+
+    def test_find_latest_resumable_picks_newest_with_state(self):
+        self.first_meeting()
+        good = self.run_dir()
+        (self.runs / "20991231-2359-没有state的更新目录").mkdir()
+        self.assertEqual(table.find_latest_resumable(self.runs), good)
+
+    def test_continue_end_to_end_via_argv(self):
+        """真实命令行：先开一场，再 `--continue "新信息"` 续上（自动选最近一场）。"""
+        import subprocess
+        self.first_meeting()
+        cfg = self.scenario / "table.toml"
+        cfg.write_text(
+            "\n".join(
+                f'[[participants]]\nname = "{n}"\n'
+                f'cmd = ["{sys.executable}", "{FAKE}", "{self.scenario}", "{n}"]\n'
+                for n in "AB"
+            ),
+            encoding="utf-8",
+        )
+        root = pathlib.Path(__file__).parent.parent
+        proc = subprocess.run(
+            [sys.executable, str(root / "table.py"), "--continue", "命令行注入的实测数据",
+             "--runs-dir", str(self.runs), "--config", str(cfg),
+             "--max-rounds", "2", "--skip-preflight"],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("续会", proc.stdout)
+        state = json.loads(self.read("state.json"))
+        self.assertEqual(state["constraints"], ["命令行注入的实测数据"])
+        self.assertEqual(state["outcome"], "CONSENSUS")
+        self.assertTrue((self.run_dir() / "final-1.md").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -142,11 +142,15 @@ class TestAdapter(unittest.TestCase):
 
 
 class TestRunStore(unittest.TestCase):
+    def roster(self):
+        return [table.ParticipantConfig("A", ("a",), "lensA", 7),
+                table.ParticipantConfig("B", ("b", "-p"))]
+
     def test_dir_naming_and_conflict(self):
         with tempfile.TemporaryDirectory() as td:
             base = pathlib.Path(td)
-            s1 = table.RunStore(base, "议题/名？")
-            s2 = table.RunStore(base, "议题/名？")
+            s1 = table.RunStore.create(base, "议题/名？", self.roster())
+            s2 = table.RunStore.create(base, "议题/名？", self.roster())
             self.assertTrue(s1.sandbox.is_dir())
             self.assertNotEqual(s1.dir, s2.dir)
             self.assertIn("议题-名", s1.dir.name)
@@ -155,7 +159,7 @@ class TestRunStore(unittest.TestCase):
         import json
         with tempfile.TemporaryDirectory() as td:
             base = pathlib.Path(td)
-            store = table.RunStore(base, "题")
+            store = table.RunStore.create(base, "题", self.roster())
             disc = tp.Discussion("题", ["A", "B"], 5)
             disc.add_proposal("A", "分析", "方案")
             store.transcript(disc)
@@ -167,9 +171,42 @@ class TestRunStore(unittest.TestCase):
             snap = json.loads((store.dir / "state.json").read_text(encoding="utf-8"))
             self.assertEqual(snap["topic"], "题")
 
+    def test_state_persists_roster_for_resume(self):
+        import json
+        with tempfile.TemporaryDirectory() as td:
+            store = table.RunStore.create(pathlib.Path(td), "题", self.roster())
+            store.state(tp.Discussion("题", ["A", "B"], 5))
+            snap = json.loads((store.dir / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(table.roster_from_json(snap["roster"]), self.roster())
+
+    def test_reopen_continues_transcript_without_duplicating(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = pathlib.Path(td)
+            store = table.RunStore.create(base, "题", self.roster())
+            disc = tp.Discussion("题", ["A", "B"], 5)
+            disc.add_proposal("A", "分析", "首场发言")
+            store.transcript(disc)
+            reopened = table.RunStore.reopen(store.dir, self.roster(), len(disc.events))
+            disc.add_note("Human", "续会发言")
+            reopened.transcript(disc)
+            text = (store.dir / "transcript.md").read_text(encoding="utf-8")
+            self.assertEqual(text.count("首场发言"), 1)   # 旧事件不重写
+            self.assertIn("续会发言", text)
+            self.assertEqual(reopened.sandbox, store.sandbox)
+
+    def test_final_archives_previous_versions(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = table.RunStore.create(pathlib.Path(td), "题", self.roster())
+            store.final("第一次结论")
+            store.final("第二次结论")
+            store.final("第三次结论")
+            self.assertEqual((store.dir / "final-1.md").read_text(encoding="utf-8"), "第一次结论")
+            self.assertEqual((store.dir / "final-2.md").read_text(encoding="utf-8"), "第二次结论")
+            self.assertEqual((store.dir / "final.md").read_text(encoding="utf-8"), "第三次结论")
+
     def test_audit_raw_final(self):
         with tempfile.TemporaryDirectory() as td:
-            store = table.RunStore(pathlib.Path(td), "题")
+            store = table.RunStore.create(pathlib.Path(td), "题", self.roster())
             store.audit({"a": 1})
             store.audit({"b": "中文"})
             store.raw("X", "坏输出")
@@ -179,6 +216,10 @@ class TestRunStore(unittest.TestCase):
             self.assertIn("中文", lines[1])
             self.assertEqual(len(list((store.dir / "raw").iterdir())), 1)
             self.assertEqual((store.dir / "final.md").read_text(encoding="utf-8"), "终局")
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 class TestPreflight(unittest.TestCase):
@@ -192,6 +233,40 @@ class TestPreflight(unittest.TestCase):
             bad = table.ParticipantConfig("Bad", ("definitely-missing-binary-xyz",))
             with self.assertRaises(SystemExit):
                 table.preflight([bad], store)
+
+
+class TestCliArgs(unittest.TestCase):
+    """main() 的参数校验（不触发真实会议）：断言具体报错，避免被 argparse 的通用错误蒙混过关。"""
+
+    def assert_exits_with(self, argv, needle):
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                table.main(argv)
+        message = f"{cm.exception} {err.getvalue()}"
+        self.assertIn(needle, message)
+
+    def test_topic_required_without_continue(self):
+        self.assert_exits_with([], "议题")
+
+    def test_info_file_and_inline_info_are_exclusive(self):
+        self.assert_exits_with(["--continue", "内联信息", "--info-file", "x.md"], "二选一")
+
+    def test_from_requires_continue(self):
+        self.assert_exits_with(["议题", "--from", "runs/x"], "--from")
+
+    def test_max_rounds_must_be_positive(self):
+        self.assert_exits_with(["议题", "--max-rounds", "0"], "--max-rounds")
+
+    def test_missing_info_file_reports_clearly(self):
+        self.assert_exits_with(["--continue", "--info-file", "/nonexistent/bench.md"],
+                               "/nonexistent/bench.md")
+
+    def test_continue_without_any_resumable_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assert_exits_with(
+                ["--continue", "--runs-dir", str(pathlib.Path(td) / "runs")], "可续")
 
 
 if __name__ == "__main__":

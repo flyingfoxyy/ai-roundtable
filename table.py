@@ -63,6 +63,17 @@ def load_config(path: pathlib.Path | None) -> list[ParticipantConfig]:
     return pcs
 
 
+def roster_to_json(pcs: list[ParticipantConfig]) -> list[dict]:
+    """把名册写进 state.json，使会议记录自描述、可续会。"""
+    return [{"name": p.name, "cmd": list(p.cmd), "lens": p.lens, "timeout": p.timeout}
+            for p in pcs]
+
+
+def roster_from_json(data: list[dict]) -> list[ParticipantConfig]:
+    return [ParticipantConfig(d["name"], tuple(d["cmd"]), d["lens"], d["timeout"])
+            for d in data]
+
+
 class CliError(Exception):
     pass
 
@@ -117,9 +128,19 @@ def call_and_parse(pc: ParticipantConfig, prompt: str, parser, cwd, audit, purpo
 
 
 class RunStore:
-    """运行目录与事件级即时落盘。"""
+    """运行目录与事件级即时落盘。用 create() 开新会，用 reopen() 续会。"""
 
-    def __init__(self, base: pathlib.Path, topic: str):
+    def __init__(self, d: pathlib.Path, roster: list[ParticipantConfig], written_events: int = 0):
+        self.dir = d
+        self.sandbox = d / "sandbox"
+        self.roster = list(roster)
+        self._written_events = written_events
+        self.sandbox.mkdir(parents=True, exist_ok=True)
+        (d / "raw").mkdir(exist_ok=True)
+
+    @classmethod
+    def create(cls, base: pathlib.Path, topic: str,
+               roster: list[ParticipantConfig]) -> "RunStore":
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
         slug = tp.sanitize_slug(topic)
         d = base / f"{stamp}-{slug}"
@@ -127,12 +148,15 @@ class RunStore:
         while d.exists():
             d = base / f"{stamp}-{slug}-{n}"
             n += 1
-        self.dir = d
-        self.sandbox = d / "sandbox"
-        self.sandbox.mkdir(parents=True)
-        (d / "raw").mkdir()
+        store = cls(d, roster)
         (d / "transcript.md").write_text(f"# 圆桌讨论\n\n**议题：** {topic}\n", encoding="utf-8")
-        self._written_events = 0
+        return store
+
+    @classmethod
+    def reopen(cls, d: pathlib.Path, roster: list[ParticipantConfig],
+               written_events: int) -> "RunStore":
+        """续会：接着已有目录写，已落盘的前 written_events 条事件不再重复写入。"""
+        return cls(d, roster, written_events)
 
     def transcript(self, disc: tp.Discussion) -> None:
         new = disc.events[self._written_events:]
@@ -145,9 +169,9 @@ class RunStore:
         self._written_events = len(disc.events)
 
     def state(self, disc: tp.Discussion) -> None:
+        snap = tp.snapshot(disc) | {"roster": roster_to_json(self.roster)}
         tmp = self.dir / "state.json.tmp"
-        tmp.write_text(json.dumps(tp.snapshot(disc), ensure_ascii=False, indent=1),
-                       encoding="utf-8")
+        tmp.write_text(json.dumps(snap, ensure_ascii=False, indent=1), encoding="utf-8")
         os.replace(tmp, self.dir / "state.json")
 
     def audit(self, rec: dict) -> None:
@@ -161,7 +185,14 @@ class RunStore:
         (self.dir / "raw" / f"{n:03d}-{name}.txt").write_text(text, encoding="utf-8")
 
     def final(self, text: str) -> None:
-        (self.dir / "final.md").write_text(text, encoding="utf-8")
+        """写终局文档；已存在的旧结论归档为 final-1.md、final-2.md…（续会保留实验前结论）。"""
+        cur = self.dir / "final.md"
+        if cur.exists():
+            n = 1
+            while (self.dir / f"final-{n}.md").exists():
+                n += 1
+            cur.rename(self.dir / f"final-{n}.md")
+        cur.write_text(text, encoding="utf-8")
 
 
 PALETTE = ["\033[36m", "\033[33m", "\033[35m", "\033[32m", "\033[34m", "\033[31m"]
@@ -218,12 +249,68 @@ def preflight(pcs: list[ParticipantConfig], store: RunStore) -> None:
 
 def run(topic: str, pcs: list[ParticipantConfig], max_rounds: int, max_context_chars: int,
         runs_dir: pathlib.Path, intervention=None, do_preflight: bool = True) -> int:
+    """开一场新会议。"""
     disc = tp.Discussion(topic, [p.name for p in pcs], max_rounds)
-    store = RunStore(runs_dir, topic)
+    store = RunStore.create(runs_dir, topic, pcs)
+    say_system(f"运行目录：{store.dir}")
+    return _conduct(disc, store, pcs, max_rounds, max_context_chars,
+                    intervention, do_preflight, fresh=True)
+
+
+def find_latest_resumable(runs_dir: pathlib.Path) -> pathlib.Path | None:
+    """最近一场留有 state.json 的会议（目录名以时间戳开头，字典序即时序）。"""
+    if not runs_dir.is_dir():
+        return None
+    candidates = [d for d in runs_dir.iterdir() if (d / "state.json").is_file()]
+    return max(candidates, key=lambda d: d.name) if candidates else None
+
+
+def run_continue(run_dir: pathlib.Path, new_info: str | None, max_rounds: int,
+                 max_context_chars: int, intervention=None,
+                 do_preflight: bool = True) -> int:
+    """续会：复原上次会议，把休会期间获得的新信息作为绑定约束注入，接着开。"""
+    state_file = run_dir / "state.json"
+    if not state_file.is_file():
+        raise SystemExit(f"无法续会：{run_dir} 下没有 state.json（该会议未进行到可续的阶段）")
+    snap = json.loads(state_file.read_text(encoding="utf-8"))
+    try:
+        disc = tp.restore(snap)
+    except (ValueError, KeyError) as exc:
+        raise SystemExit(f"无法续会：{state_file} 不是本版本可复原的记录（{exc}）")
+    if "roster" not in snap:
+        raise SystemExit(f"无法续会：{state_file} 未记录参与者名册（由旧版本产生）")
+    pcs = roster_from_json(snap["roster"])
+
+    store = RunStore.reopen(run_dir, pcs, len(disc.events))
+    say_system(f"续会：{run_dir}")
+    say_system(f"上次结束于 {snap['outcome']}"
+               f"（{disc.current.version_id if disc.current else '无草案'}，周期 {disc.cycle}）")
+    recess = f"[续会] 上次结束于 {snap['outcome']}，休会后带着新信息重开。"
+    if disc.consensus_reached():
+        recess += "注意：上次已达成共识，本次在既有共识上重开，新证据可能推翻它。"
+    disc.add_note("Human", recess)
+    if new_info:
+        label = disc.add_constraint(new_info)
+        say("Human", "", f"休会期间的新信息 {label} · 已作废当前版本全部票", new_info)
+    else:
+        say_system("未提供新信息，直接接着讨论")
+    store.transcript(disc)
+    store.state(disc)
+    return _conduct(disc, store, pcs, max_rounds, max_context_chars,
+                    intervention, do_preflight, fresh=False)
+
+
+def _conduct(disc: tp.Discussion, store: RunStore, pcs: list[ParticipantConfig],
+             max_rounds: int, max_context_chars: int, intervention, do_preflight: bool,
+             fresh: bool) -> int:
+    """会议主体：新会议跑阶段0+合成后进入评审循环；续会直接进入评审循环。"""
+    topic = disc.topic
     by_name = {p.name: p for p in pcs}
     colors = {p.name: PALETTE[i % len(PALETTE)] for i, p in enumerate(pcs)}
     check_input = intervention if intervention is not None else default_intervention
-    say_system(f"运行目录：{store.dir}")
+    first_cycle_no = disc.cycle + 1          # 新会议为 1；续会接着上次的周期号
+    last_cycle_no = first_cycle_no + max_rounds - 1
+    disc.max_rounds = last_cycle_no          # 终局文档里显示的周期上限
 
     if do_preflight:
         preflight(pcs, store)
@@ -283,42 +370,59 @@ def run(topic: str, pcs: list[ParticipantConfig], max_rounds: int, max_context_c
         return False
 
     # ── 阶段0：独立立论（并行、互不可见） ──
-    say_system("阶段0：独立立论")
-    jobs = [(pc, tp.build_proposal_prompt(topic, disc.constraints, pc.name, pc.lens),
-             tp.parse_proposal, "proposal") for pc in pcs]
-    for name, (status, payload) in batch(jobs).items():
-        if status == "ok":
-            analysis, prop = payload
-            disc.add_proposal(name, analysis, prop)
-            say(name, colors[name], "独立立论", f"{analysis}\n\n【独立方案】\n{prop}")
-        else:
-            disc.add_note(name, "阶段0未产出独立方案")
-    store.transcript(disc)
-    store.state(disc)
-    if not disc.proposals:
-        say_system("全部参与者阶段0失败，中止")
-        return 1
-
-    # ── 阶段1：合成 v1 ──
-    if not checkpoint():
-        say_system("阶段1：合成 v1")
-        if not editor_call(
-            lambda pc: tp.build_merge_prompt(topic, disc.constraints, pc.name, pc.lens,
-                                             disc.proposals),
-            "merge",
-        ):
-            say_system("全部主编候选失败，中止")
-            return 1
+    if fresh:
+        say_system("阶段0：独立立论")
+        jobs = [(pc, tp.build_proposal_prompt(topic, disc.constraints, pc.name, pc.lens),
+                 tp.parse_proposal, "proposal") for pc in pcs]
+        for name, (status, payload) in batch(jobs).items():
+            if status == "ok":
+                analysis, prop = payload
+                disc.add_proposal(name, analysis, prop)
+                say(name, colors[name], "独立立论", f"{analysis}\n\n【独立方案】\n{prop}")
+            else:
+                disc.add_note(name, "阶段0未产出独立方案")
         store.transcript(disc)
         store.state(disc)
+        if not disc.proposals:
+            say_system("全部参与者阶段0失败，中止")
+            return 1
+
+        # ── 阶段1：合成 v1 ──
+        if not checkpoint():
+            say_system("阶段1：合成 v1")
+            if not editor_call(
+                lambda pc: tp.build_merge_prompt(topic, disc.constraints, pc.name, pc.lens,
+                                                 disc.proposals),
+                "merge",
+            ):
+                say_system("全部主编候选失败，中止")
+                return 1
+            store.transcript(disc)
+            store.state(disc)
+
+    # ── 续会补版：带着新证据先由主编出新版，再进入盲审（与会中插话的处理顺序一致） ──
+    if not fresh and not stopped and disc.current is not None and disc.needs_revision():
+        disc.cycle = first_cycle_no
+        say_system(f"周期 {first_cycle_no}：主编据休会期间的新信息修订")
+        ctx = tp.render_transcript(disc.events, max_context_chars)
+        if editor_call(
+            lambda pc: tp.build_revision_prompt(topic, disc.constraints, pc.name, pc.lens,
+                                                disc.current, disc.active_blockers(), ctx),
+            f"revise-c{first_cycle_no}",
+        ):
+            store.transcript(disc)
+            store.state(disc)
+        else:
+            say_system("全部主编候选失败，直接进入终局")
+            stopped = True
 
     # ── 评审周期 ──
     if not stopped and disc.current is not None:
-        for cycle in range(1, max_rounds + 1):
+        for cycle in range(first_cycle_no, last_cycle_no + 1):
             disc.cycle = cycle
             targets = disc.pending_reviewers()
             if targets:
-                say_system(f"周期 {cycle}/{max_rounds}：评审 {disc.current.version_id}"
+                say_system(f"周期 {cycle}/{last_cycle_no}：评审 {disc.current.version_id}"
                            f"（{', '.join(targets)}）")
                 ctx = tp.render_transcript(disc.events, max_context_chars)
                 jobs = [(by_name[n],
@@ -362,7 +466,7 @@ def run(topic: str, pcs: list[ParticipantConfig], max_rounds: int, max_context_c
                     break
             if disc.consensus_reached():
                 break
-            if cycle == max_rounds:
+            if cycle == last_cycle_no:
                 break
             if disc.needs_revision():
                 say_system(f"周期 {cycle}：主编修订")
@@ -403,21 +507,51 @@ def run(topic: str, pcs: list[ParticipantConfig], max_rounds: int, max_context_c
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="table", description="多 AI 圆桌辩论")
-    ap.add_argument("topic", help="讨论议题（纯文本）")
-    ap.add_argument("--max-rounds", type=int, default=5, help="评审周期上限（默认 5）")
+    ap.add_argument("topic", nargs="?",
+                    help="讨论议题；配合 --continue 时表示休会期间获得的新信息")
+    ap.add_argument("--continue", dest="cont", action="store_true",
+                    help="从上次会议结束处继续（默认续最近一场，用 --from 指定场次）")
+    ap.add_argument("--from", dest="from_dir", type=pathlib.Path, default=None,
+                    metavar="RUN_DIR", help="续会时指定要继续的会议目录")
+    ap.add_argument("--info-file", type=pathlib.Path, default=None,
+                    help="从文件读取新信息（长实验报告用；与位置参数二选一）")
+    ap.add_argument("--max-rounds", type=int, default=5,
+                    help="评审周期上限；续会时表示本次新增的轮数预算（默认 5）")
     ap.add_argument("--config", type=pathlib.Path, default=None,
-                    help="参与者配置 TOML（默认自动找 ./table.toml）")
+                    help="参与者配置 TOML（默认 ./table.toml，缺失则用 table.toml.bak）")
     ap.add_argument("--max-context-chars", type=int, default=120_000,
                     help="讨论记录拼装上限字符数（默认 120000）")
     ap.add_argument("--runs-dir", type=pathlib.Path, default=pathlib.Path("runs"))
     ap.add_argument("--skip-preflight", action="store_true", help="跳过启动预检")
     args = ap.parse_args(argv)
+
     if args.max_rounds < 1:
         raise SystemExit("--max-rounds 至少为 1")
-    pcs = load_config(args.config)
+    if args.topic and args.info_file:
+        raise SystemExit("新信息只能二选一：位置参数或 --info-file")
+    if args.from_dir and not args.cont:
+        raise SystemExit("--from 需要配合 --continue 使用")
+    if not args.cont and not args.topic:
+        raise SystemExit("请给出议题；或用 --continue 继续上一场会议")
+
+    new_info = args.topic
+    if args.info_file:
+        if not args.info_file.is_file():
+            raise SystemExit(f"读不到新信息文件：{args.info_file}")
+        new_info = args.info_file.read_text(encoding="utf-8").strip()
+
     try:
-        return run(args.topic, pcs, args.max_rounds, args.max_context_chars,
-                   args.runs_dir, do_preflight=not args.skip_preflight)
+        if args.cont:
+            run_dir = args.from_dir or find_latest_resumable(args.runs_dir)
+            if run_dir is None:
+                raise SystemExit(f"{args.runs_dir} 下没有可续的会议（需要含 state.json 的目录）")
+            if args.config:
+                say_system("续会使用会议记录中的参与者名册，--config 被忽略")
+            return run_continue(run_dir, new_info, args.max_rounds, args.max_context_chars,
+                                do_preflight=not args.skip_preflight)
+        return run(args.topic, load_config(args.config), args.max_rounds,
+                   args.max_context_chars, args.runs_dir,
+                   do_preflight=not args.skip_preflight)
     except KeyboardInterrupt:
         print("\n已中断；transcript/state/session 均已即时落盘。")
         return 130

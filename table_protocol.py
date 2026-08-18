@@ -278,15 +278,26 @@ def _vote_dict(v: Vote) -> dict:
     }
 
 
+def _vote_obj(d: dict) -> Vote:
+    return Vote(d["participant"], d["version_id"], Verdict(d["verdict"]), d["statement"],
+                tuple(Blocker(b["severity"], b["text"]) for b in d["blockers"]))
+
+
+SNAPSHOT_FORMAT = 2  # 1 = 无 events/proposals 的早期格式，不可续会
+
+
 def snapshot(disc: Discussion) -> dict:
-    """state.json 用的可 JSON 化快照。"""
+    """state.json 用的可 JSON 化快照；完整到足以 restore() 出等价的 Discussion。"""
     return {
+        "format": SNAPSHOT_FORMAT,
         "topic": disc.topic,
         "participants": disc.participants,
         "constraints": disc.constraints,
         "cycle": disc.cycle,
         "max_rounds": disc.max_rounds,
         "outcome": disc.outcome().value,
+        "unaddressed_constraints": disc.unaddressed_constraints,
+        "proposals": disc.proposals,
         "drafts": [
             {"number": d.number, "version_id": d.version_id, "author": d.author,
              "text": d.text, "changelog": d.changelog}
@@ -294,7 +305,31 @@ def snapshot(disc: Discussion) -> dict:
         ],
         "votes": {p: _vote_dict(v) for p, v in disc.votes.items()},
         "vote_log": [_vote_dict(v) for v in disc.vote_log],
+        "events": [
+            {"kind": e.kind, "cycle": e.cycle, "participant": e.participant, "text": e.text}
+            for e in disc.events
+        ],
     }
+
+
+def restore(snap: dict) -> Discussion:
+    """从 snapshot() 的产物复原 Discussion；格式不符抛 ValueError。"""
+    if snap.get("format") != SNAPSHOT_FORMAT:
+        raise ValueError(
+            f"快照格式不兼容（需要 format={SNAPSHOT_FORMAT}，实际 {snap.get('format')!r}）"
+        )
+    disc = Discussion(snap["topic"], snap["participants"], snap["max_rounds"])
+    disc.constraints = list(snap["constraints"])
+    disc.cycle = snap["cycle"]
+    disc.unaddressed_constraints = snap["unaddressed_constraints"]
+    disc.proposals = dict(snap["proposals"])
+    disc.drafts = [Draft(d["number"], d["text"], d["author"], d["changelog"])
+                   for d in snap["drafts"]]
+    disc.votes = {p: _vote_obj(v) for p, v in snap["votes"].items()}
+    disc.vote_log = [_vote_obj(v) for v in snap["vote_log"]]
+    disc.events = [Event(e["kind"], e["cycle"], e["participant"], e["text"])
+                   for e in snap["events"]]
+    return disc
 
 
 def sanitize_slug(topic: str, max_len: int = 40) -> str:

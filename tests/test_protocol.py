@@ -307,5 +307,56 @@ class TestRenderFinal(unittest.TestCase):
         self.assertEqual(blind_section.count("同一假设"), 1)  # vote_log 中出现两次，盲区去重为一条
 
 
+class TestSnapshotRestore(unittest.TestCase):
+    def build(self):
+        disc = tp.Discussion("续会议题", ["A", "B", "C"], 5)
+        disc.add_proposal("A", "分析A", "方案A")
+        disc.add_proposal("B", "分析B", "方案B")
+        disc.add_draft("A", "v1文", "分歧点", "主编说明")
+        disc.record_vote("B", tp.ParsedVerdict(tp.Verdict.ACCEPT, "残余风险X"), "论述B")
+        disc.record_vote("C", tp.ParsedVerdict(
+            tp.Verdict.BLOCK, "raw", (tp.Blocker("硬伤", "缺X"), tp.Blocker("待验证", "QPS"))), "论述C")
+        disc.add_draft("B", "v2文", "变更清单")
+        disc.record_invalid("C", "两次解析失败")
+        disc.add_constraint("必须支持离线")
+        disc.cycle = 2
+        return disc
+
+    def test_roundtrip_preserves_everything(self):
+        import json
+        disc = self.build()
+        back = tp.restore(json.loads(json.dumps(tp.snapshot(disc))))
+        self.assertEqual(back.topic, disc.topic)
+        self.assertEqual(back.participants, disc.participants)
+        self.assertEqual(back.max_rounds, disc.max_rounds)
+        self.assertEqual(back.cycle, disc.cycle)
+        self.assertEqual(back.constraints, disc.constraints)
+        self.assertEqual(back.proposals, disc.proposals)
+        self.assertEqual(back.drafts, disc.drafts)
+        self.assertEqual(back.events, disc.events)
+        self.assertEqual(back.votes, disc.votes)
+        self.assertEqual(back.vote_log, disc.vote_log)
+        self.assertEqual(back.unaddressed_constraints, disc.unaddressed_constraints)
+        self.assertIs(back.outcome(), disc.outcome())
+
+    def test_roundtrip_preserves_vote_binding_and_blockers(self):
+        import json
+        disc = tp.Discussion("题", ["A", "B"], 5)
+        disc.add_draft("A", "v1文", "log")
+        disc.record_vote("B", tp.ParsedVerdict(
+            tp.Verdict.BLOCK, "raw", (tp.Blocker("硬伤", "缺X"),)), "s")
+        back = tp.restore(json.loads(json.dumps(tp.snapshot(disc))))
+        self.assertEqual(back.votes["B"].version_id, back.current.version_id)  # 票仍绑定该版本
+        self.assertEqual(back.active_blockers(), [("B", tp.Blocker("硬伤", "缺X"))])
+        back.add_draft("B", "v2文", "改了")
+        self.assertEqual(back.votes, {})        # 复原后的状态机行为不变：新版本清票
+
+    def test_restore_rejects_foreign_or_old_format(self):
+        with self.assertRaises(ValueError):
+            tp.restore({"topic": "旧", "participants": ["A", "B"], "max_rounds": 5})  # 无 format
+        with self.assertRaises(ValueError):
+            tp.restore({"format": 999, "topic": "未来", "participants": ["A", "B"]})
+
+
 if __name__ == "__main__":
     unittest.main()
