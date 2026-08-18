@@ -25,14 +25,24 @@ def write_script(scenario, role, responses):
 
 
 class TestConfig(unittest.TestCase):
-    def test_missing_file_generates_default_roster(self):
+    def test_falls_back_to_bak_template_when_no_user_config(self):
+        """无自定义 table.toml 时使用随代码分发的 table.toml.bak，且不创建任何文件。"""
         with tempfile.TemporaryDirectory() as td, contextlib.chdir(td):
             pcs = table.load_config(None)
-            self.assertTrue(pathlib.Path("table.toml").exists())   # 名册文件被自动生成
-            self.assertEqual([p.name for p in pcs], ["Claude", "Gemini", "Codex"])
-            self.assertEqual(pcs[0].cmd, ("claude", "-p"))
-            self.assertEqual(pcs[0].timeout, 300)
-            self.assertEqual(table.load_config(None), pcs)          # 再次加载走文件，结果一致
+            self.assertFalse(pathlib.Path("table.toml").exists())   # 不自动生成
+        self.assertEqual([p.name for p in pcs], ["Claude", "Gemini", "Codex"])
+        self.assertEqual(pcs[0].cmd, ("claude", "-p"))
+        self.assertEqual(pcs[0].timeout, 300)
+
+    def test_user_config_takes_precedence_over_bak(self):
+        with tempfile.TemporaryDirectory() as td, contextlib.chdir(td):
+            pathlib.Path("table.toml").write_text(
+                '[[participants]]\nname = "Mine1"\ncmd = ["a"]\n'
+                '[[participants]]\nname = "Mine2"\ncmd = ["b"]\n',
+                encoding="utf-8",
+            )
+            pcs = table.load_config(None)
+        self.assertEqual([p.name for p in pcs], ["Mine1", "Mine2"])
 
     def test_load_toml(self):
         with tempfile.TemporaryDirectory() as td:

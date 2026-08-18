@@ -23,8 +23,17 @@ BLOCK 一次列全分级问题）→ 主编修订（逐条处理）→ 循环。
 
 ## 配置：参与者名册
 
-`table.toml` 是**唯一名册**——哪些 AI 参会、怎么调用，全由这个文件控制。
-文件不存在时首次运行会自动生成默认名册（Claude / Gemini / Codex），编辑即可增删 AI：
+哪些 AI 参会、怎么调用，由名册文件控制。查找顺序：
+
+1. 当前目录的 **`table.toml`** —— 你的本地名册（已被 `.gitignore` 忽略，不会提交）
+2. 没有则回退到随代码分发的 **`table.toml.bak`** —— 默认模板（Claude / Gemini / Codex）
+3. `--config <路径>` 可显式指定任意名册文件
+
+自定义就是复制模板再改：
+
+```bash
+cp table.toml.bak table.toml
+```
 
 ```toml
 [[participants]]

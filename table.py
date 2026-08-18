@@ -29,40 +29,24 @@ class ParticipantConfig:
     timeout: int = 300
 
 
-DEFAULT_TOML = """\
-# Table 参与者名册：每个 [[participants]] 段 = 一个 AI。
-# 增删 AI = 增删段落；调整调用方式改 cmd（argv 数组，prompt 走 stdin，回复取 stdout）。
-# 段落顺序 = 发言与轮值主编顺序（第一个参与者负责合成 v1）。
-# 本文件是唯一名册：缺失时程序会重新生成这份默认配置（Claude/Gemini/Codex）。
-
-[[participants]]
-name = "Claude"
-cmd = ["claude", "-p"]
-lens = "重点审查：可维护性与长期复杂度"
-timeout = 300
-
-[[participants]]
-name = "Gemini"
-cmd = ["gemini"]
-lens = "重点审查：性能、扩展性与运维负担"
-timeout = 300
-
-[[participants]]
-name = "Codex"
-cmd = ["codex", "exec", "--skip-git-repo-check", "-"]
-lens = "重点审查：工程落地成本与迁移风险"
-timeout = 300
-"""
+BAK_ROSTER = pathlib.Path(__file__).resolve().parent / "table.toml.bak"
 
 
 def load_config(path: pathlib.Path | None) -> list[ParticipantConfig]:
-    """path=None：加载 ./table.toml，不存在则先生成默认名册再加载。显式 path 不存在 → SystemExit。"""
+    """path=None：优先用 ./table.toml，没有则回退到随代码分发的 table.toml.bak。
+
+    显式 path 不存在 → SystemExit。
+    """
     if path is None:
         path = pathlib.Path("table.toml")
         if not path.exists():
-            path.write_text(DEFAULT_TOML, encoding="utf-8")
-            print(f"未找到 table.toml，已生成默认名册（Claude/Gemini/Codex）：{path.resolve()}\n"
-                  f"编辑该文件即可增删 AI 或调整调用方式。")
+            path = BAK_ROSTER
+            if not path.exists():
+                raise SystemExit(
+                    f"找不到参与者名册：当前目录无 table.toml，默认模板也不存在（{BAK_ROSTER}）"
+                )
+            print(f"未找到自定义 table.toml，使用默认名册模板：{path}\n"
+                  f"如需增删 AI，把它复制为 table.toml 再编辑（table.toml 不会被 git 跟踪）。")
     elif not path.exists():
         raise SystemExit(f"配置文件不存在：{path}")
     data = tomllib.loads(path.read_text(encoding="utf-8"))

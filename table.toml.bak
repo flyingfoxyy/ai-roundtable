@@ -1,7 +1,10 @@
-# Table 参与者名册：每个 [[participants]] 段 = 一个 AI。
+# Table 参与者名册【默认模板】：每个 [[participants]] 段 = 一个 AI。
 # 增删 AI = 增删段落；调整调用方式改 cmd（argv 数组，prompt 走 stdin，回复取 stdout）。
 # 段落顺序 = 发言与轮值主编顺序（第一个参与者负责合成 v1）。
-# 本文件是唯一名册：缺失时程序会重新生成这份默认配置（Claude/Gemini/Codex）。
+#
+# 本文件是随代码分发的默认模板，圆桌会议在没有自定义名册时直接使用它。
+# 要自定义：复制为 table.toml 再编辑（table.toml 已被 .gitignore 忽略，属于你的本地配置）。
+#   cp table.toml.bak table.toml
 
 [[participants]]
 name = "Claude"
