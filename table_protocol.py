@@ -378,7 +378,7 @@ class VersionStat:
 
 
 _DISPOSITION_RE = re.compile(
-    r"^\s*[-*]?\s*(B\d+)\s*[:：]?\s*(采纳|部分采纳|拒绝)\s*[:：,，—\-]*\s*(.*)$"
+    r"^\s*[-*]?\s*(B\d+)\s*[:：]?\s*(采纳|部分采纳|拒绝)\s*[:：,，。；;—\-]*\s*(.*)$"
 )
 _DECLARED_RE = re.compile(r"[（(]\s*重提\s*(B\d+)\s*[)）]")
 

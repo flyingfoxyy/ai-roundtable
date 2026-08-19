@@ -396,6 +396,14 @@ class TestBlockerLedger(unittest.TestCase):
                           "B3": ("拒绝", "超出议题范围")})
         self.assertEqual(tp.parse_dispositions("自由文本的变更清单，没有编号"), {})
 
+    def test_parse_dispositions_strips_chinese_full_stop_separator(self):
+        """真实主编写的是「B1: 采纳。删除…」，句号是分隔符不是正文。"""
+        self.assertEqual(tp.parse_dispositions("B1: 采纳。删除了终止条件"),
+                         {"B1": ("采纳", "删除了终止条件")})
+        self.assertEqual(tp.parse_dispositions("B2: 拒绝；超出范围"),
+                         {"B2": ("拒绝", "超出范围")})
+        self.assertEqual(tp.parse_dispositions("B3: 采纳"), {"B3": ("采纳", "")})
+
     def test_flags_unanswered_blocker(self):
         disc = tp.Discussion("题", ["A", "B"], 5)
         disc.add_draft("A", "v1", "log")

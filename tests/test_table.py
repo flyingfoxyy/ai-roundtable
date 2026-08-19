@@ -32,7 +32,7 @@ class TestConfig(unittest.TestCase):
             self.assertFalse(pathlib.Path("table.toml").exists())   # 不自动生成
         self.assertEqual([p.name for p in pcs], ["Claude", "Gemini", "Codex"])
         self.assertEqual(pcs[0].cmd, ("claude", "-p"))
-        self.assertEqual(pcs[0].timeout, 300)
+        self.assertEqual(pcs[0].timeout, table.DEFAULT_TIMEOUT)
 
     def test_user_config_takes_precedence_over_bak(self):
         with tempfile.TemporaryDirectory() as td, contextlib.chdir(td):
@@ -43,6 +43,15 @@ class TestConfig(unittest.TestCase):
             )
             pcs = table.load_config(None)
         self.assertEqual([p.name for p in pcs], ["Mine1", "Mine2"])
+
+    def test_default_timeout_accommodates_slow_reasoning_models(self):
+        """实测：Claude 单次调用常达 180~290 秒，300 秒会频繁误判超时。"""
+        with tempfile.TemporaryDirectory() as td:
+            f = pathlib.Path(td) / "t.toml"
+            f.write_text('[[participants]]\nname = "X"\ncmd = ["a"]\n'
+                         '[[participants]]\nname = "Y"\ncmd = ["b"]\n', encoding="utf-8")
+            pcs = table.load_config(f)
+        self.assertGreaterEqual(pcs[0].timeout, 600)
 
     def test_load_toml(self):
         with tempfile.TemporaryDirectory() as td:

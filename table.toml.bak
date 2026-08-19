@@ -10,16 +10,16 @@
 name = "Claude"
 cmd = ["claude", "-p"]
 lens = "重点审查：可维护性与长期复杂度"
-timeout = 300
+timeout = 600
 
 [[participants]]
 name = "Gemini"
 cmd = ["gemini"]
 lens = "重点审查：性能、扩展性与运维负担"
-timeout = 300
+timeout = 600
 
 [[participants]]
 name = "Codex"
 cmd = ["codex", "exec", "--skip-git-repo-check", "-"]
 lens = "重点审查：工程落地成本与迁移风险"
-timeout = 300
+timeout = 600

@@ -21,12 +21,16 @@ import tomllib
 import table_protocol as tp
 
 
+# 实测：Claude 单次调用常达 180~290 秒，300 秒会频繁误判超时并浪费一次重试
+DEFAULT_TIMEOUT = 600
+
+
 @dataclasses.dataclass(frozen=True)
 class ParticipantConfig:
     name: str
     cmd: tuple[str, ...]
     lens: str = ""
-    timeout: int = 300
+    timeout: int = DEFAULT_TIMEOUT
 
 
 BAK_ROSTER = pathlib.Path(__file__).resolve().parent / "table.toml.bak"
@@ -55,7 +59,7 @@ def load_config(path: pathlib.Path | None) -> list[ParticipantConfig]:
         if not item.get("name") or not item.get("cmd"):
             raise SystemExit("每个 participant 需要 name 和非空 cmd")
         pcs.append(ParticipantConfig(item["name"], tuple(item["cmd"]),
-                                     item.get("lens", ""), int(item.get("timeout", 300))))
+                                     item.get("lens", ""), int(item.get("timeout", DEFAULT_TIMEOUT))))
     if len(pcs) < 2:
         raise SystemExit("至少需要 2 名参与者")
     if len({p.name for p in pcs}) != len(pcs):
