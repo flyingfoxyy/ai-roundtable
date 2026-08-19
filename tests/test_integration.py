@@ -439,5 +439,39 @@ class TestDivergenceTracking(Base):
         self.assertIn("核对", review_v2)
 
 
+class TestStallStop(Base):
+    def test_stalled_discussion_stops_early_and_says_why(self):
+        """轮数预算 6，但第 3 版起连续打转 → 提前散会，省下后续调用。"""
+        write_script(self.scenario, "A", [
+            proposal("pa"), editor_out("v1文", "分歧点"),
+            block(("硬伤", "（重提 B1）说明里依然没有数据")),      # 评审 B 起草的 v2
+            editor_out("v3文", "B2: 采纳，再改一次"),              # 轮到 A 当主编
+        ])
+        write_script(self.scenario, "B", [
+            proposal("pb"), block(("硬伤", "阈值缺出处")),
+            editor_out("v2文", "B1: 采纳，已补说明"),              # 轮到 B 当主编
+            block(("硬伤", "（重提 B1）第三次了，依然没有出处")),   # 评审 v3
+            "个人建议：先做压测",
+        ])
+        code = self.run_table([fake_pc(n, self.scenario) for n in "AB"], max_rounds=6)
+        self.assertEqual(code, 0)
+        state = json.loads(self.read("state.json"))
+        self.assertLess(state["cycle"], 6)                  # 没有耗完预算
+        final = self.read("final.md")
+        self.assertIn("提前散会", final)
+        self.assertIn("硬伤数连续", final)
+        transcript = self.read("transcript.md")
+        self.assertIn("[提前散会]", transcript)
+
+    def test_healthy_discussion_is_not_cut_short(self):
+        write_script(self.scenario, "A", [
+            proposal("pa"), editor_out("v1文", "分歧"), accept("确认理由"),
+        ])
+        write_script(self.scenario, "B", [proposal("pb"), accept("同意理由")])
+        self.run_table([fake_pc(n, self.scenario) for n in "AB"], max_rounds=3)
+        self.assertNotIn("提前散会", self.read("final.md"))
+        self.assertIn("CONSENSUS", self.read("final.md"))
+
+
 if __name__ == "__main__":
     unittest.main()

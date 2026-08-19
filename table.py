@@ -471,6 +471,14 @@ def _conduct(disc: tp.Discussion, store: RunStore, pcs: list[ParticipantConfig],
                     break
             if disc.consensus_reached():
                 break
+            stall = tp.stall_check(disc)
+            if stall.stalled:
+                say_system(f"⚠ {stall.reason}")
+                say_system("提前散会，进入终局输出（可先做实验，再用 --continue 带新证据回来）")
+                disc.add_note("Human", f"[提前散会] {stall.reason}")
+                store.transcript(disc)
+                store.state(disc)
+                break
             if cycle == last_cycle_no:
                 break
             if disc.needs_revision():
@@ -505,7 +513,7 @@ def _conduct(disc: tp.Discussion, store: RunStore, pcs: list[ParticipantConfig],
         if status == "ok":
             recommendation = payload
             say(name, colors[name], "主编个人建议", recommendation)
-    store.final(tp.render_final(disc, recommendation))
+    store.final(tp.render_final(disc, recommendation, stall=tp.stall_check(disc)))
     store.state(disc)
     say_system(f"结果：{result.value} → {store.dir / 'final.md'}")
     signals = tp.divergence_signals(disc)

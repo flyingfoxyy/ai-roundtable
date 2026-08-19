@@ -497,6 +497,36 @@ def version_stats(disc: Discussion) -> list[VersionStat]:
     return stats
 
 
+@dataclass(frozen=True)
+class StallVerdict:
+    """讨论是否已进入打转。仅陈述机械事实，判断是否继续由调用方决定。"""
+    stalled: bool
+    reason: str = ""
+
+
+def stall_check(disc: Discussion) -> StallVerdict:
+    """连续两版硬伤数未下降、且期间出现过重提 → 判定为打转。
+
+    两个条件缺一不可：硬伤持平但每轮都是新问题，说明讨论在深挖而非原地打转。
+    """
+    stats = version_stats(disc)
+    if len(stats) < 3:
+        return StallVerdict(False)
+    if not (stats[-1].stalled and stats[-2].stalled):
+        return StallVerdict(False)
+    recent = {stats[-1].version_id, stats[-2].version_id}
+    recurrences = [r for e in blocker_ledger(disc) for r in e.recurrences
+                   if r.version_id in recent]
+    if not recurrences:
+        return StallVerdict(False)
+    who = "、".join(dict.fromkeys(r.participant for r in recurrences))
+    return StallVerdict(
+        True,
+        f"硬伤数连续两版未下降，且期间出现 {len(recurrences)} 处重提（{who}）——"
+        f"同一问题被反复提出，继续论证不太可能收敛。",
+    )
+
+
 def render_diff(prev: Draft, cur: Draft, max_lines: int = 120) -> str:
     """两版草案之间的 unified diff，供评审核对主编声称的处置是否属实。"""
     lines = list(difflib.unified_diff(
@@ -748,13 +778,19 @@ def render_events_md(events: list[Event]) -> str:
     return "".join(parts)
 
 
-def render_final(disc: Discussion, recommendation: str | None) -> str:
+def render_final(disc: Discussion, recommendation: str | None,
+                 stall: StallVerdict | None = None) -> str:
     result = disc.outcome()
     lines = [
         f"# 圆桌结果：{result.value}", "",
         f"**议题：** {disc.topic}", "",
         f"**参与者：** {', '.join(disc.participants)} · 评审周期 {disc.cycle}/{disc.max_rounds}", "",
     ]
+    if stall is not None and stall.stalled:
+        lines += [
+            "> **提前散会**：" + stall.reason,
+            "> 建议转为实验或人工裁决——见下方「共同盲区与外部验证建议」与「分歧演化」。", "",
+        ]
     if disc.constraints:
         lines += ["**人类约束：**"]
         lines += [f"- H{i + 1}. {c}" for i, c in enumerate(disc.constraints)]

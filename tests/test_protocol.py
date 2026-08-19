@@ -612,5 +612,63 @@ class TestVersionDiff(unittest.TestCase):
         self.assertNotIn("核对", p)
 
 
+class TestStallDetection(unittest.TestCase):
+    """打转即止损：连续两版硬伤不降 + 出现重提 → 建议提前散会。"""
+
+    def blk(self, *items):
+        return tp.ParsedVerdict(tp.Verdict.BLOCK, "raw",
+                                tuple(tp.Blocker(s, t) for s, t in items))
+
+    def stalled_discussion(self):
+        disc = tp.Discussion("题", ["A", "B", "C"], 8)
+        disc.add_draft("A", "v1", "分歧点")
+        disc.record_vote("B", self.blk(("硬伤", "阈值缺出处")), "s")
+        disc.add_draft("B", "v2", "B1: 采纳，已补说明")
+        disc.record_vote("C", self.blk(("硬伤", "（重提 B1）说明里依然没有数据")), "s")
+        disc.add_draft("C", "v3", "B2: 采纳，再次补充")
+        disc.record_vote("A", self.blk(("硬伤", "（重提 B1）第三次了，仍无出处")), "s")
+        return disc
+
+    def test_detects_stall_after_two_stalled_versions_with_recurrence(self):
+        disc = self.stalled_discussion()
+        verdict = tp.stall_check(disc)
+        self.assertTrue(verdict.stalled)
+        self.assertIn("硬伤数连续", verdict.reason)
+        self.assertIn("重提", verdict.reason)
+
+    def test_no_stall_when_progress_is_being_made(self):
+        disc = tp.Discussion("题", ["A", "B", "C"], 8)
+        disc.add_draft("A", "v1", "log")
+        disc.record_vote("B", self.blk(("硬伤", "问题一"), ("硬伤", "问题二")), "s")
+        disc.add_draft("B", "v2", "B1: 采纳\nB2: 采纳")
+        disc.record_vote("C", self.blk(("硬伤", "另一个全新的问题")), "s")   # 2 → 1，在收敛
+        self.assertFalse(tp.stall_check(disc).stalled)
+
+    def test_no_stall_without_recurrence_even_if_counts_flat(self):
+        """硬伤数持平但每轮都是全新问题 —— 是在深挖，不是打转。"""
+        disc = tp.Discussion("题", ["A", "B", "C"], 8)
+        disc.add_draft("A", "v1", "log")
+        disc.record_vote("B", self.blk(("硬伤", "第一个问题")), "s")
+        disc.add_draft("B", "v2", "B1: 采纳")
+        disc.record_vote("C", self.blk(("硬伤", "毫不相干的第二个问题")), "s")
+        disc.add_draft("C", "v3", "B2: 采纳")
+        disc.record_vote("A", self.blk(("硬伤", "又一个无关的第三点")), "s")
+        self.assertFalse(tp.stall_check(disc).stalled)
+
+    def test_too_early_to_judge(self):
+        disc = tp.Discussion("题", ["A", "B"], 8)
+        disc.add_draft("A", "v1", "log")
+        disc.record_vote("B", self.blk(("硬伤", "问题")), "s")
+        self.assertFalse(tp.stall_check(disc).stalled)
+        self.assertFalse(tp.stall_check(tp.Discussion("题", ["A", "B"], 8)).stalled)
+
+    def test_final_document_reports_stall_termination(self):
+        disc = self.stalled_discussion()
+        doc = tp.render_final(disc, None, stall=tp.stall_check(disc))
+        self.assertIn("提前散会", doc)
+        self.assertIn("硬伤数连续", doc)
+        self.assertIn("转为实验", doc)
+
+
 if __name__ == "__main__":
     unittest.main()
