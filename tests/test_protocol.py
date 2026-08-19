@@ -358,5 +358,220 @@ class TestSnapshotRestore(unittest.TestCase):
             tp.restore({"format": 999, "topic": "未来", "participants": ["A", "B"]})
 
 
+class TestBlockerLedger(unittest.TestCase):
+    """blocker 台账：跨版本追踪每条分歧的生命周期。"""
+
+    def blk(self, *items):
+        return tp.ParsedVerdict(tp.Verdict.BLOCK, "raw",
+                                tuple(tp.Blocker(s, t) for s, t in items))
+
+    def test_ids_assigned_deterministically_by_first_appearance(self):
+        disc = tp.Discussion("题", ["A", "B", "C"], 5)
+        disc.add_draft("A", "v1", "log")
+        disc.record_vote("C", self.blk(("硬伤", "问题Z")), "s")
+        disc.record_vote("B", self.blk(("硬伤", "问题Y"), ("偏好", "问题X")), "s")
+        ledger = tp.blocker_ledger(disc)
+        # 同一版本内按名册顺序（B 先于 C），票内按行序
+        self.assertEqual([(e.id, e.text) for e in ledger],
+                         [("B1", "问题Y"), ("B2", "问题X"), ("B3", "问题Z")])
+        self.assertEqual(ledger[0].raised_by, "B")
+        self.assertEqual(ledger[0].raised_at, disc.current.version_id)
+        self.assertEqual(tp.blocker_ledger(disc), ledger)      # 可复现
+
+    def test_identical_text_across_versions_reuses_id(self):
+        disc = tp.Discussion("题", ["A", "B"], 5)
+        disc.add_draft("A", "v1", "log")
+        disc.record_vote("B", self.blk(("硬伤", "同一句话")), "s")
+        disc.add_draft("A", "v2", " B1: 采纳")
+        disc.record_vote("B", self.blk(("硬伤", " 同一句话 ")), "s")   # 归一化后相同
+        ledger = tp.blocker_ledger(disc)
+        self.assertEqual([e.id for e in ledger], ["B1"])
+        self.assertEqual(len(ledger[0].occurrences), 2)
+
+    def test_parse_dispositions_lenient_and_degrades(self):
+        text = "- B1: 采纳，已改用实测阈值\n* B2 部分采纳 —— 只保留必要项\nB3：拒绝，超出议题范围"
+        self.assertEqual(tp.parse_dispositions(text),
+                         {"B1": ("采纳", "已改用实测阈值"),
+                          "B2": ("部分采纳", "只保留必要项"),
+                          "B3": ("拒绝", "超出议题范围")})
+        self.assertEqual(tp.parse_dispositions("自由文本的变更清单，没有编号"), {})
+
+    def test_flags_unanswered_blocker(self):
+        disc = tp.Discussion("题", ["A", "B"], 5)
+        disc.add_draft("A", "v1", "log")
+        disc.record_vote("B", self.blk(("硬伤", "问题P"), ("硬伤", "问题Q")), "s")
+        disc.add_draft("A", "v2", "B1: 采纳，已修")          # 只回应了 B1
+        ledger = {e.id: e for e in tp.blocker_ledger(disc)}
+        self.assertEqual(ledger["B1"].disposition, "采纳")
+        self.assertIsNone(ledger["B2"].disposition)
+        self.assertTrue(ledger["B2"].unanswered)
+        self.assertFalse(ledger["B1"].unanswered)
+
+    def test_no_numbering_in_changelog_skips_verification(self):
+        """老会议记录的变更清单没有编号 → 整版跳过核对，不产生满屏 ⚠。"""
+        disc = tp.Discussion("题", ["A", "B"], 5)
+        disc.add_draft("A", "v1", "log")
+        disc.record_vote("B", self.blk(("硬伤", "问题P"), ("硬伤", "问题Q")), "s")
+        disc.add_draft("A", "v2", "自由文本：我修了一些东西")
+        ledger = tp.blocker_ledger(disc)
+        self.assertFalse(any(e.unanswered for e in ledger))
+
+    def test_declaration_marker_extracted_out_of_text(self):
+        """「（重提 B1）」是结构化信息，不该留在正文里污染台账与相似度比较。"""
+        disc = tp.Discussion("题", ["A", "B", "C"], 5)
+        disc.add_draft("A", "v1", "log")
+        disc.record_vote("B", self.blk(("硬伤", "阈值缺出处")), "s")
+        disc.add_draft("A", "v2", "B1: 采纳")
+        disc.record_vote("C", self.blk(("硬伤", "（重提 B1）换个说法说同一件事")), "s")
+        ledger = {e.id: e for e in tp.blocker_ledger(disc)}
+        self.assertEqual(ledger["B2"].text, "换个说法说同一件事")   # 标记已剥离
+        self.assertEqual(ledger["B2"].recurs_of, "B1")             # 提升为字段
+        self.assertIsNone(ledger["B1"].recurs_of)
+        self.assertIn("这是 B1 的重提", tp.render_divergence(disc))
+
+    def test_detects_declared_recurrence(self):
+        """评审显式声明「重提 B1」→ 确定的重提记录，不依赖文本相似度。"""
+        disc = tp.Discussion("题", ["A", "B", "C"], 5)
+        disc.add_draft("A", "v1", "log")
+        disc.record_vote("B", self.blk(("硬伤", "阈值没有基准测试支撑")), "s")
+        disc.add_draft("A", "v2", "B1: 采纳，已补充说明")
+        disc.record_vote("C", self.blk(("硬伤", "（重提 B1）换个说法：这个数字依然没有出处")), "s")
+        ledger = {e.id: e for e in tp.blocker_ledger(disc)}
+        rec = ledger["B1"].recurrences
+        self.assertEqual(len(rec), 1)
+        self.assertEqual(rec[0].participant, "C")
+        self.assertTrue(rec[0].declared)          # 声明的，而非猜的
+
+    def test_detects_suspected_recurrence_by_similarity(self):
+        disc = tp.Discussion("题", ["A", "B", "C"], 5)
+        disc.add_draft("A", "v1", "log")
+        disc.record_vote("B", self.blk(("硬伤", "阈值没有基准测试支撑")), "s")
+        disc.add_draft("A", "v2", "B1: 采纳，已补充说明")
+        disc.record_vote("C", self.blk(("硬伤", "阈值没有实测数据支撑")), "s")  # 换个说法重提
+        ledger = {e.id: e for e in tp.blocker_ledger(disc)}
+        rec = ledger["B1"].recurrences
+        self.assertEqual(len(rec), 1)
+        self.assertEqual(rec[0].blocker_id, "B2")
+        self.assertEqual(rec[0].participant, "C")
+        self.assertFalse(rec[0].declared)         # 仅为相似度提示
+        self.assertGreaterEqual(rec[0].ratio, tp.RECURRENCE_RATIO)
+
+    def test_no_recurrence_when_texts_unrelated(self):
+        disc = tp.Discussion("题", ["A", "B", "C"], 5)
+        disc.add_draft("A", "v1", "log")
+        disc.record_vote("B", self.blk(("硬伤", "缺少并发写入的实测数据")), "s")
+        disc.add_draft("A", "v2", "B1: 采纳")
+        # 同一主题下的不同问题（实测标定相似度 0.36），不得误报为重提
+        disc.record_vote("C", self.blk(("硬伤", "缺少数据迁移的回滚方案")), "s")
+        ledger = {e.id: e for e in tp.blocker_ledger(disc)}
+        self.assertEqual(ledger["B1"].recurrences, [])
+
+    def test_version_stats_and_stalled_severity_flag(self):
+        disc = tp.Discussion("题", ["A", "B"], 5)
+        disc.add_draft("A", "v1", "log")
+        disc.record_vote("B", self.blk(("硬伤", "P1"), ("偏好", "P2")), "s")
+        disc.add_draft("A", "v2", "B1: 采纳")
+        disc.record_vote("B", self.blk(("硬伤", "P3")), "s")
+        disc.add_draft("A", "v3", "B3: 采纳")
+        disc.record_vote("B", self.blk(("硬伤", "P4")), "s")
+        stats = tp.version_stats(disc)
+        self.assertEqual([(s.version_id[:2], s.counts["硬伤"], s.counts["偏好"]) for s in stats],
+                         [("v1", 1, 1), ("v2", 1, 0), ("v3", 1, 0)])
+        self.assertEqual(stats[0].votes, {"B": "BLOCK"})
+        self.assertFalse(stats[0].stalled)      # 首版无从比较
+        self.assertTrue(stats[1].stalled)       # 硬伤数未下降
+        self.assertTrue(stats[2].stalled)
+
+    def test_empty_discussion_is_safe(self):
+        disc = tp.Discussion("题", ["A", "B"], 5)
+        self.assertEqual(tp.blocker_ledger(disc), [])
+        self.assertEqual(tp.version_stats(disc), [])
+
+
+class TestRenderDivergence(unittest.TestCase):
+    def build(self):
+        disc = tp.Discussion("题", ["A", "B", "C"], 5)
+        disc.add_draft("A", "v1", "分歧点")
+        disc.record_vote("B", tp.ParsedVerdict(tp.Verdict.BLOCK, "raw", (
+            tp.Blocker("硬伤", "阈值没有基准测试支撑"),
+            tp.Blocker("偏好", "命名不一致"))), "s")
+        disc.record_vote("C", tp.ParsedVerdict(tp.Verdict.ACCEPT, "可容忍"), "s")
+        disc.add_draft("B", "v2", "B1: 采纳，已补实测\nB2: 拒绝，超出范围")
+        disc.record_vote("C", tp.ParsedVerdict(tp.Verdict.BLOCK, "raw", (
+            tp.Blocker("硬伤", "（重提 B1）数字依然没有出处"),)), "s")
+        return disc
+
+    def test_renders_table_ledger_and_signals(self):
+        out = tp.render_divergence(self.build())
+        self.assertIn("## 分歧演化", out)
+        self.assertIn("B1", out)
+        self.assertIn("阈值没有基准测试支撑", out)
+        self.assertIn("采纳", out)
+        self.assertIn("重提", out)
+        self.assertIn("C", out)
+        self.assertIn("硬伤", out)
+
+    def test_signal_summary_counts_warnings(self):
+        signals = tp.divergence_signals(self.build())
+        self.assertEqual(signals["重提"], 1)
+        self.assertEqual(signals["硬伤数不降"], 1)   # v2 与 v1 同为 1 条硬伤
+        self.assertEqual(signals["未回应"], 0)
+        self.assertEqual(tp.divergence_signals(tp.Discussion("题", ["A", "B"], 5)),
+                         {"重提": 0, "未回应": 0, "硬伤数不降": 0})
+
+    def test_final_document_embeds_divergence_section(self):
+        doc = tp.render_final(self.build(), None)
+        self.assertIn("## 分歧演化", doc)
+        self.assertIn("B1", doc)
+
+    def test_divergence_omitted_when_never_blocked(self):
+        disc = tp.Discussion("题", ["A", "B"], 5)
+        disc.add_draft("A", "v1", "log")
+        disc.record_vote("B", tp.ParsedVerdict(tp.Verdict.ACCEPT, "风险声明"), "s")
+        self.assertEqual(tp.render_divergence(disc), "")
+        self.assertNotIn("分歧演化", tp.render_final(disc, None))
+
+
+class TestNumberedPrompts(unittest.TestCase):
+    """编号进 prompt：主编按编号回应、评审可声明重提。"""
+
+    def build(self):
+        disc = tp.Discussion("题", ["A", "B", "C"], 5)
+        disc.add_draft("A", "v1文", "分歧点")
+        disc.record_vote("B", tp.ParsedVerdict(tp.Verdict.BLOCK, "raw", (
+            tp.Blocker("硬伤", "缺实测数据"), tp.Blocker("偏好", "命名不一致"))), "s")
+        return disc
+
+    def test_revision_prompt_numbers_blockers_and_demands_per_id_reply(self):
+        disc = self.build()
+        p = tp.build_revision_prompt("题", [], "B", "", disc.current,
+                                     disc.active_blockers(), "记录",
+                                     ledger=tp.blocker_ledger(disc))
+        self.assertIn("B1 （B）[硬伤] 缺实测数据", p)
+        self.assertIn("B2 （B）[偏好] 命名不一致", p)
+        self.assertIn("B1: 采纳", p)          # 格式示例
+        self.assertIn("每条以编号开头", p)
+
+    def test_revision_prompt_without_ledger_keeps_plain_list(self):
+        disc = self.build()
+        p = tp.build_revision_prompt("题", [], "B", "", disc.current,
+                                     disc.active_blockers(), "记录")
+        self.assertIn("（B）[硬伤] 缺实测数据", p)
+        self.assertNotIn("每条以编号开头", p)
+
+    def test_review_prompt_lists_open_blockers_for_recurrence_declaration(self):
+        disc = self.build()
+        p = tp.build_review_prompt("题", [], "C", "", disc.current, "记录", False,
+                                   ledger=tp.blocker_ledger(disc))
+        self.assertIn("B1 [硬伤] 缺实测数据", p)
+        self.assertIn("（重提 B1）", p)        # 声明格式说明
+        self.assertIn("未解决", p)
+
+    def test_review_prompt_without_ledger_unchanged(self):
+        disc = self.build()
+        p = tp.build_review_prompt("题", [], "C", "", disc.current, "记录", False)
+        self.assertNotIn("重提", p)
+
+
 if __name__ == "__main__":
     unittest.main()

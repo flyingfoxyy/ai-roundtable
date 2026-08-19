@@ -381,5 +381,43 @@ class TestContinue(Base):
         self.assertTrue((self.run_dir() / "final-1.md").exists())
 
 
+class TestDivergenceTracking(Base):
+    def test_ledger_records_disposition_and_declared_recurrence(self):
+        """v1 被 BLOCK → 主编声称采纳 → 评审声明重提 → final.md 记下打转信号。"""
+        write_script(self.scenario, "A", [
+            proposal("pa"), editor_out("v1文", "分歧点"),
+            block(("硬伤", "（重提 B1）数字依然没有出处")),   # A 评审 B 起草的 v2
+            "无共识时的个人建议",
+        ])
+        write_script(self.scenario, "B", [
+            proposal("pb"),
+            block(("硬伤", "阈值缺实测支撑"), ("偏好", "命名不一致")),
+            editor_out("v2文", "B1: 采纳，已补实测\nB2: 拒绝，超出范围"),   # 轮值主编是 B
+        ])
+        code = self.run_table([fake_pc(n, self.scenario) for n in "AB"], max_rounds=2)
+        self.assertEqual(code, 0)
+
+        # 编号进了主编 prompt，声明格式进了评审 prompt
+        revise_prompt = (self.scenario / "calls" / "B-3-prompt.txt").read_text(encoding="utf-8")
+        self.assertIn("B1 （B）[硬伤] 阈值缺实测支撑", revise_prompt)
+        review2_prompt = (self.scenario / "calls" / "A-3-prompt.txt").read_text(encoding="utf-8")
+        self.assertIn("B1 [硬伤] 阈值缺实测支撑", review2_prompt)
+        self.assertIn("（重提 B1）", review2_prompt)
+
+        final = self.read("final.md")
+        self.assertIn("## 分歧演化", final)
+        self.assertIn("主编处置：采纳", final)
+        self.assertIn("评审声明重提", final)
+        self.assertIn("主编处置：拒绝", final)
+
+    def test_no_divergence_section_when_consensus_without_blocks(self):
+        write_script(self.scenario, "A", [
+            proposal("pa"), editor_out("v1文", "分歧"), accept("确认理由"),
+        ])
+        write_script(self.scenario, "B", [proposal("pb"), accept("同意理由")])
+        self.run_table([fake_pc(n, self.scenario) for n in "AB"], max_rounds=2)
+        self.assertNotIn("分歧演化", self.read("final.md"))
+
+
 if __name__ == "__main__":
     unittest.main()

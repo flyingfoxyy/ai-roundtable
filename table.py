@@ -407,7 +407,8 @@ def _conduct(disc: tp.Discussion, store: RunStore, pcs: list[ParticipantConfig],
         ctx = tp.render_transcript(disc.events, max_context_chars)
         if editor_call(
             lambda pc: tp.build_revision_prompt(topic, disc.constraints, pc.name, pc.lens,
-                                                disc.current, disc.active_blockers(), ctx),
+                                                disc.current, disc.active_blockers(), ctx,
+                                                ledger=tp.blocker_ledger(disc)),
             f"revise-c{first_cycle_no}",
         ):
             store.transcript(disc)
@@ -425,9 +426,10 @@ def _conduct(disc: tp.Discussion, store: RunStore, pcs: list[ParticipantConfig],
                 say_system(f"周期 {cycle}/{last_cycle_no}：评审 {disc.current.version_id}"
                            f"（{', '.join(targets)}）")
                 ctx = tp.render_transcript(disc.events, max_context_chars)
+                ledger = tp.blocker_ledger(disc)
                 jobs = [(by_name[n],
                          tp.build_review_prompt(topic, disc.constraints, n, by_name[n].lens,
-                                                disc.current, ctx, cycle == 1),
+                                                disc.current, ctx, cycle == 1, ledger=ledger),
                          tp.parse_verdict, f"review-c{cycle}") for n in targets]
                 res = batch(jobs)
                 for n in targets:
@@ -474,7 +476,8 @@ def _conduct(disc: tp.Discussion, store: RunStore, pcs: list[ParticipantConfig],
                 if not editor_call(
                     lambda pc: tp.build_revision_prompt(topic, disc.constraints, pc.name,
                                                         pc.lens, disc.current,
-                                                        disc.active_blockers(), ctx),
+                                                        disc.active_blockers(), ctx,
+                                                        ledger=tp.blocker_ledger(disc)),
                     f"revise-c{cycle}",
                 ):
                     say_system("全部主编候选失败，提前终局")
@@ -502,6 +505,10 @@ def _conduct(disc: tp.Discussion, store: RunStore, pcs: list[ParticipantConfig],
     store.final(tp.render_final(disc, recommendation))
     store.state(disc)
     say_system(f"结果：{result.value} → {store.dir / 'final.md'}")
+    signals = tp.divergence_signals(disc)
+    hits = [f"{k} {v}" for k, v in signals.items() if v]
+    if hits:
+        say_system(f"⚠ 打转信号：{'、'.join(hits)} · 详见 final.md「分歧演化」")
     return 0
 
 

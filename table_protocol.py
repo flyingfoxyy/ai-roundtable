@@ -1,6 +1,7 @@
 """Table 圆桌协议纯逻辑：解析、状态机、prompt 拼装、渲染。禁止任何 IO。"""
 from __future__ import annotations
 
+import difflib
 import hashlib
 import re
 from dataclasses import dataclass
@@ -332,10 +333,216 @@ def restore(snap: dict) -> Discussion:
     return disc
 
 
+RECURRENCE_RATIO = 0.60  # 相似度提示阈值（实测标定：换说法重提 0.41~0.70，同领域不同问题 0.29~0.36，
+                         # 两段重叠，故相似度只作弱提示，重提以评审显式声明为准）
+SEVERITIES = ("硬伤", "偏好", "待验证")
+
+
+@dataclass(frozen=True)
+class Occurrence:
+    """某条 blocker 的一次出现。"""
+    blocker_id: str
+    participant: str
+    version_id: str
+    ratio: float = 1.0      # 1.0 = 原文复现；<1 = 相似度提示
+    declared: bool = False  # True = 评审自己声明「重提 Bn」，而非代码推断
+
+
+@dataclass
+class LedgerEntry:
+    """台账中的一条分歧及其跨版本生命周期。"""
+    id: str
+    severity: str
+    text: str
+    raised_by: str
+    raised_at: str          # 首次出现的版本号
+    occurrences: list[Occurrence]
+    disposition: str | None = None   # 主编在下一版变更清单中声明的处置
+    reason: str = ""
+    unanswered: bool = False         # 下一版用了编号格式却漏掉了这条
+    recurs_of: str | None = None     # 评审声明「本条是 B<n> 的重提」
+    recurrences: list[Occurrence] = None  # 声称处理后仍疑似重提
+
+    def __post_init__(self):
+        if self.recurrences is None:
+            self.recurrences = []
+
+
+@dataclass(frozen=True)
+class VersionStat:
+    version_id: str
+    author: str
+    counts: dict[str, int]
+    votes: dict[str, str]
+    stalled: bool  # 相对上一版，硬伤数未下降
+
+
+_DISPOSITION_RE = re.compile(
+    r"^\s*[-*]?\s*(B\d+)\s*[:：]?\s*(采纳|部分采纳|拒绝)\s*[:：,，—\-]*\s*(.*)$"
+)
+_DECLARED_RE = re.compile(r"[（(]\s*重提\s*(B\d+)\s*[)）]")
+
+
+def parse_dispositions(changelog: str) -> dict[str, tuple[str, str]]:
+    """从变更清单里解析「B<n>: 采纳/部分采纳/拒绝 + 理由」；无编号格式则返回空字典。"""
+    out: dict[str, tuple[str, str]] = {}
+    for line in changelog.splitlines():
+        m = _DISPOSITION_RE.match(line)
+        if m:
+            out[m.group(1)] = (m.group(2), m.group(3).strip())
+    return out
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", "", text)
+
+
+def _split_declaration(text: str) -> tuple[str, str | None]:
+    """把「（重提 B1）」从正文里剥离成结构化字段。"""
+    m = _DECLARED_RE.search(text)
+    if not m:
+        return text.strip(), None
+    return _DECLARED_RE.sub("", text, count=1).strip(" 　:：,，-—"), m.group(1)
+
+
+def _blockers_on(disc: Discussion, version_id: str) -> list[tuple[str, Blocker]]:
+    """某版本上的全部 BLOCK 条目，按名册顺序、票内行序。"""
+    order = {p: i for i, p in enumerate(disc.participants)}
+    votes = [v for v in disc.vote_log
+             if v.version_id == version_id and v.verdict is Verdict.BLOCK]
+    votes.sort(key=lambda v: order.get(v.participant, len(order)))
+    return [(v.participant, b) for v in votes for b in v.blockers]
+
+
+def blocker_ledger(disc: Discussion) -> list[LedgerEntry]:
+    """把 vote_log 横向整理成分歧台账：编号、处置核对、疑似重提。"""
+    entries: list[LedgerEntry] = []
+    by_norm: dict[str, LedgerEntry] = {}
+    for draft in disc.drafts:
+        for participant, blk in _blockers_on(disc, draft.version_id):
+            text, declared_of = _split_declaration(blk.text)
+            key = _norm(text)
+            entry = by_norm.get(key)
+            if entry is None:
+                entry = LedgerEntry(
+                    id=f"B{len(entries) + 1}", severity=blk.severity, text=text,
+                    raised_by=participant, raised_at=draft.version_id, occurrences=[],
+                    recurs_of=declared_of,
+                )
+                entries.append(entry)
+                by_norm[key] = entry
+            entry.occurrences.append(Occurrence(entry.id, participant, draft.version_id))
+
+    # 主编在「下一版」变更清单中对各 blocker 的处置；无编号格式的版本整版跳过核对
+    for prev, nxt in zip(disc.drafts, disc.drafts[1:]):
+        dispositions = parse_dispositions(nxt.changelog)
+        if not dispositions:
+            continue
+        for entry in entries:
+            if not any(o.version_id == prev.version_id for o in entry.occurrences):
+                continue
+            if entry.id in dispositions:
+                if entry.disposition is None:
+                    entry.disposition, entry.reason = dispositions[entry.id]
+            else:
+                entry.unanswered = True
+
+    # 声称「采纳/部分采纳」之后，后续版本中的重提：以评审显式声明为准，相似度仅作补充提示
+    index = {e.id: e for e in entries}
+    for entry in entries:
+        if entry.disposition not in ("采纳", "部分采纳"):
+            continue
+        last_seen = max(d.number for d in disc.drafts
+                        if any(o.version_id == d.version_id for o in entry.occurrences))
+        for later in (d for d in disc.drafts if d.number > last_seen):
+            for participant, blk in _blockers_on(disc, later.version_id):
+                text, declared_of = _split_declaration(blk.text)
+                other_id = _id_of(entries, text)
+                if other_id == entry.id:
+                    continue
+                if declared_of == entry.id:
+                    entry.recurrences.append(
+                        Occurrence(other_id, participant, later.version_id, 1.0, True))
+                    continue
+                if declared_of:   # 声明了但指向别人，不再用相似度二次猜测
+                    continue
+                ratio = difflib.SequenceMatcher(None, _norm(entry.text), _norm(text)).ratio()
+                if ratio >= RECURRENCE_RATIO:
+                    entry.recurrences.append(
+                        Occurrence(other_id, participant, later.version_id, round(ratio, 2)))
+    return entries
+
+
+def _id_of(entries: list[LedgerEntry], text: str) -> str:
+    key = _norm(text)
+    for e in entries:
+        if _norm(e.text) == key:
+            return e.id
+    raise KeyError(text)
+
+
+def version_stats(disc: Discussion) -> list[VersionStat]:
+    """每版的 blocker 分级计数与表态；stalled = 硬伤数相对上一版未下降。"""
+    stats: list[VersionStat] = []
+    prev_hard: int | None = None
+    for draft in disc.drafts:
+        blockers = _blockers_on(disc, draft.version_id)
+        counts = {s: sum(1 for _, b in blockers if b.severity == s) for s in SEVERITIES}
+        votes = {v.participant: v.verdict.value for v in disc.vote_log
+                 if v.version_id == draft.version_id}
+        hard = counts["硬伤"]
+        stats.append(VersionStat(draft.version_id, draft.author, counts, votes,
+                                 stalled=prev_hard is not None and hard >= prev_hard and hard > 0))
+        prev_hard = hard
+    return stats
+
+
 def sanitize_slug(topic: str, max_len: int = 40) -> str:
     cleaned = re.sub(r"[^\w-]+", "-", topic).strip("-_")
     return cleaned[:max_len].strip("-_") or "untitled"
 
+
+def divergence_signals(disc: Discussion) -> dict[str, int]:
+    """三类打转信号的计数（均为机械可判定的事实，不含价值判断）。"""
+    ledger = blocker_ledger(disc)
+    return {
+        "重提": sum(len(e.recurrences) for e in ledger),
+        "未回应": sum(1 for e in ledger if e.unanswered),
+        "硬伤数不降": sum(1 for s in version_stats(disc) if s.stalled),
+    }
+
+
+def render_divergence(disc: Discussion) -> str:
+    """分歧演化章节：版本趋势表 + blocker 台账。从未有人 BLOCK 过则返回空串。"""
+    ledger = blocker_ledger(disc)
+    if not ledger:
+        return ""
+    stats = version_stats(disc)
+    lines = ["## 分歧演化", "",
+             "| 版本 | 主编 | 硬伤 | 偏好 | 待验证 | 表态 |",
+             "|---|---|---|---|---|---|"]
+    for s in stats:
+        votes = " ".join(f"{p}:{v}" for p, v in s.votes.items()) or "—"
+        mark = " ⚠" if s.stalled else ""
+        lines.append(f"| {s.version_id}{mark} | {s.author} | {s.counts['硬伤']} | "
+                     f"{s.counts['偏好']} | {s.counts['待验证']} | {votes} |")
+    lines += ["", "> ⚠ 标记的版本：硬伤数相对上一版未下降。", "", "### 分歧台账", ""]
+    for e in ledger:
+        seen = "、".join(dict.fromkeys(o.version_id for o in e.occurrences))
+        lines.append(f"**{e.id}** [{e.severity}] {e.text}")
+        lines.append(f"- 首次提出：{e.raised_by} @ {e.raised_at}；出现于 {seen}")
+        if e.recurs_of:
+            lines.append(f"- ↩ 评审声明这是 {e.recurs_of} 的重提")
+        if e.disposition:
+            reason = f"——{e.reason}" if e.reason else ""
+            lines.append(f"- 主编处置：{e.disposition}{reason}")
+        if e.unanswered:
+            lines.append("- ⚠ 下一版变更清单使用了编号格式，但未回应本条")
+        for r in e.recurrences:
+            how = "评审声明重提" if r.declared else f"疑似重提（文本相似 {r.ratio}，仅作提示）"
+            lines.append(f"- ⚠ {how}：{r.participant} @ {r.version_id}（{r.blocker_id}）")
+        lines.append("")
+    return "\n".join(lines)
 
 _FMT_VERDICT = f"""你的输出必须是：先写公开论述，然后独占一行写 {MARKER_VERDICT}，其后是表态：
 - 接受当前草案：首行为 ACCEPT，随后必须附「残余风险声明」——当前方案最强的反例或失败边界，
@@ -388,9 +595,23 @@ def build_merge_prompt(topic: str, constraints: list[str], name: str, lens: str,
 
 
 def build_review_prompt(topic: str, constraints: list[str], name: str, lens: str,
-                        draft: Draft, transcript: str, first_cycle: bool) -> str:
+                        draft: Draft, transcript: str, first_cycle: bool,
+                        ledger: list[LedgerEntry] | None = None) -> str:
     extra = ("\n本周期是第 1 评审周期：若你选择 ACCEPT，必须逐条回应变更清单中列出的每一个分歧点。"
              if first_cycle else "")
+    open_items = ""
+    if ledger:
+        listing = "\n".join(f"- {e.id} [{e.severity}] {e.text}"
+                            f"（{e.raised_by} 提出"
+                            f"{'，主编声称' + e.disposition if e.disposition else ''}）"
+                            for e in ledger)
+        open_items = f"""
+
+此前讨论中提出过的分歧（编号台账）：
+{listing}
+
+若你本次的某条 BLOCK 是在重提上表中**仍未解决**的问题，请在该条描述前标注编号，
+写成：`- [硬伤] （重提 B1）你的描述`。这能让记录如实反映讨论是否在原地打转。"""
     return f"""{_preamble(name, lens, "你是当前版本的评审者。同周期其他评审者的发言对你不可见。", topic, constraints)}
 
 已公开的讨论记录：
@@ -400,7 +621,7 @@ def build_review_prompt(topic: str, constraints: list[str], name: str, lens: str
 {draft.text}
 
 上一版变更清单：
-{draft.changelog}
+{draft.changelog}{open_items}
 
 请评审当前草案。{extra}
 {_FMT_VERDICT}"""
@@ -423,11 +644,23 @@ def build_confirm_prompt(topic: str, constraints: list[str], name: str, lens: st
 
 def build_revision_prompt(topic: str, constraints: list[str], name: str, lens: str,
                           draft: Draft, blockers: list[tuple[str, Blocker]],
-                          transcript: str) -> str:
+                          transcript: str, ledger: list[LedgerEntry] | None = None) -> str:
+    ids = {_norm(e.text): e.id for e in ledger} if ledger else {}
     if blockers:
-        blk = "\n".join(f"- （{p}）[{b.severity}] {b.text}" for p, b in blockers)
+        blk = "\n".join(
+            (f"- {ids[_norm(_split_declaration(b.text)[0])]} （{p}）[{b.severity}] {b.text}"
+             if _norm(_split_declaration(b.text)[0]) in ids
+             else f"- （{p}）[{b.severity}] {b.text}")
+            for p, b in blockers)
     else:
         blk = "（本轮无 BLOCK，修订由新的人类约束触发）"
+    numbering = """
+
+变更清单必须使用上面的编号，每条以编号开头，例如：
+B1: 采纳，改用实测阈值
+B2: 部分采纳，只保留必要项
+B3: 拒绝，超出本议题范围
+（评审会机械核对你是否逐条处理，请勿遗漏任何一条。）""" if ids and blockers else ""
     return f"""{_preamble(name, lens, "你是本周期的轮值主编。", topic, constraints)}
 
 已公开的讨论记录：
@@ -440,7 +673,7 @@ def build_revision_prompt(topic: str, constraints: list[str], name: str, lens: s
 {blk}
 
 请产出下一版草案。变更清单必须逐条说明对每个 blocker（及每条新的人类约束）的处理：
-采纳 / 部分采纳 / 拒绝并说明理由。
+采纳 / 部分采纳 / 拒绝并说明理由。{numbering}
 {_FMT_EDITOR}"""
 
 
@@ -544,6 +777,9 @@ def render_final(disc: Discussion, recommendation: str | None) -> str:
         (v.participant, b) for v in disc.vote_log for b in v.blockers
         if b.severity == "待验证" and not (b.text in seen or seen.add(b.text))
     ]
+    divergence = render_divergence(disc)
+    if divergence:
+        lines += ["", divergence]
     lines += ["", "## 共同盲区与外部验证建议", ""]
     if pending:
         lines += [f"- （{p}）{b.text}" for p, b in pending]
