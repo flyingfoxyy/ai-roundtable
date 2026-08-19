@@ -497,6 +497,19 @@ def version_stats(disc: Discussion) -> list[VersionStat]:
     return stats
 
 
+def render_diff(prev: Draft, cur: Draft, max_lines: int = 120) -> str:
+    """两版草案之间的 unified diff，供评审核对主编声称的处置是否属实。"""
+    lines = list(difflib.unified_diff(
+        prev.text.splitlines(), cur.text.splitlines(),
+        fromfile=prev.version_id, tofile=cur.version_id, lineterm="", n=2))
+    if not lines:
+        return f"（{prev.version_id} → {cur.version_id}：正文未改动）"
+    if len(lines) > max_lines:
+        omitted = len(lines) - max_lines
+        lines = lines[:max_lines] + [f"…（diff 过长，已截断 {omitted} 行，完整新版见上方草案全文）"]
+    return "\n".join(lines)
+
+
 def sanitize_slug(topic: str, max_len: int = 40) -> str:
     cleaned = re.sub(r"[^\w-]+", "-", topic).strip("-_")
     return cleaned[:max_len].strip("-_") or "untitled"
@@ -596,9 +609,20 @@ def build_merge_prompt(topic: str, constraints: list[str], name: str, lens: str,
 
 def build_review_prompt(topic: str, constraints: list[str], name: str, lens: str,
                         draft: Draft, transcript: str, first_cycle: bool,
-                        ledger: list[LedgerEntry] | None = None) -> str:
+                        ledger: list[LedgerEntry] | None = None,
+                        diff: str | None = None) -> str:
     extra = ("\n本周期是第 1 评审周期：若你选择 ACCEPT，必须逐条回应变更清单中列出的每一个分歧点。"
              if first_cycle else "")
+    diff_block = ""
+    if diff:
+        diff_block = f"""
+
+本版相对上一版的实际改动（unified diff）：
+```
+{diff}
+```
+请**核对**变更清单里声称的处置与上面的实际改动是否一致：
+声称"采纳"却没有对应改动、或悄悄回退了此前已解决的内容，都属于硬伤，应据实 BLOCK。"""
     open_items = ""
     if ledger:
         listing = "\n".join(f"- {e.id} [{e.severity}] {e.text}"
@@ -621,7 +645,7 @@ def build_review_prompt(topic: str, constraints: list[str], name: str, lens: str
 {draft.text}
 
 上一版变更清单：
-{draft.changelog}{open_items}
+{draft.changelog}{diff_block}{open_items}
 
 请评审当前草案。{extra}
 {_FMT_VERDICT}"""

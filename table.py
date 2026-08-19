@@ -427,9 +427,12 @@ def _conduct(disc: tp.Discussion, store: RunStore, pcs: list[ParticipantConfig],
                            f"（{', '.join(targets)}）")
                 ctx = tp.render_transcript(disc.events, max_context_chars)
                 ledger = tp.blocker_ledger(disc)
+                prev = disc.drafts[-2] if len(disc.drafts) > 1 else None
+                diff = tp.render_diff(prev, disc.current) if prev else None
                 jobs = [(by_name[n],
                          tp.build_review_prompt(topic, disc.constraints, n, by_name[n].lens,
-                                                disc.current, ctx, cycle == 1, ledger=ledger),
+                                                disc.current, ctx, cycle == 1,
+                                                ledger=ledger, diff=diff),
                          tp.parse_verdict, f"review-c{cycle}") for n in targets]
                 res = batch(jobs)
                 for n in targets:

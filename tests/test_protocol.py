@@ -573,5 +573,44 @@ class TestNumberedPrompts(unittest.TestCase):
         self.assertNotIn("重提", p)
 
 
+class TestVersionDiff(unittest.TestCase):
+    """给评审看 diff：让主编声称的处置变得可核对。"""
+
+    def test_renders_unified_diff_between_versions(self):
+        prev = tp.Draft(1, "第一行\n第二行\n第三行", "A", "log")
+        cur = tp.Draft(2, "第一行\n改过的第二行\n第三行", "B", "log")
+        d = tp.render_diff(prev, cur)
+        self.assertIn("-第二行", d)
+        self.assertIn("+改过的第二行", d)
+        self.assertIn("第一行", d)          # 上下文保留
+        self.assertIn(prev.version_id, d)
+        self.assertIn(cur.version_id, d)
+
+    def test_identical_text_reports_no_change(self):
+        prev = tp.Draft(1, "一模一样", "A", "log")
+        cur = tp.Draft(2, "一模一样", "B", "log")
+        self.assertIn("未改动", tp.render_diff(prev, cur))
+
+    def test_huge_diff_is_truncated(self):
+        prev = tp.Draft(1, "\n".join(f"行{i}" for i in range(500)), "A", "log")
+        cur = tp.Draft(2, "\n".join(f"改{i}" for i in range(500)), "B", "log")
+        d = tp.render_diff(prev, cur, max_lines=40)
+        self.assertLessEqual(len(d.splitlines()), 45)
+        self.assertIn("已截断", d)
+
+    def test_review_prompt_embeds_diff_and_asks_to_verify_claims(self):
+        prev = tp.Draft(1, "旧的方案文本", "A", "分歧点")
+        cur = tp.Draft(2, "新的方案文本", "B", "B1: 采纳，已修")
+        p = tp.build_review_prompt("题", [], "C", "", cur, "记录", False, diff=tp.render_diff(prev, cur))
+        self.assertIn("-旧的方案文本", p)
+        self.assertIn("+新的方案文本", p)
+        self.assertIn("核对", p)
+
+    def test_review_prompt_without_diff_unchanged(self):
+        cur = tp.Draft(1, "v1", "A", "分歧点")
+        p = tp.build_review_prompt("题", [], "C", "", cur, "记录", True)
+        self.assertNotIn("核对", p)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -419,5 +419,25 @@ class TestDivergenceTracking(Base):
         self.assertNotIn("分歧演化", self.read("final.md"))
 
 
+    def test_reviewer_of_second_version_receives_diff(self):
+        """v2 的评审 prompt 里应含 v1→v2 的实际改动，用于核对主编声称的处置。"""
+        write_script(self.scenario, "A", [
+            proposal("pa"), editor_out("原始方案正文", "分歧点"),
+            block(("硬伤", "改动与声称不符")),
+            "个人建议",
+        ])
+        write_script(self.scenario, "B", [
+            proposal("pb"), block(("硬伤", "缺实测")),
+            editor_out("修订后的方案正文", "B1: 采纳，已补实测"),
+        ])
+        self.run_table([fake_pc(n, self.scenario) for n in "AB"], max_rounds=2)
+        review_v1 = (self.scenario / "calls" / "B-2-prompt.txt").read_text(encoding="utf-8")
+        review_v2 = (self.scenario / "calls" / "A-3-prompt.txt").read_text(encoding="utf-8")
+        self.assertNotIn("unified diff", review_v1)      # 首版无可比对象
+        self.assertIn("-原始方案正文", review_v2)
+        self.assertIn("+修订后的方案正文", review_v2)
+        self.assertIn("核对", review_v2)
+
+
 if __name__ == "__main__":
     unittest.main()
